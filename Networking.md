@@ -759,3 +759,7 @@ The load balancer periodically pokes each server:
 
 - **HTTP health check** — "I'm sending you GET /health. Can you answer 200 OK?" This confirms the application is actually working — not just that the port is open. Think of it as asking "how are you?" and expecting a coherent answer.
 
+---
+
+
+
