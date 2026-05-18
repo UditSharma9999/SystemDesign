@@ -1062,13 +1062,12 @@ Every interview tip, comparison table, and key phrase from the entire Networking
 
 ### L4 vs L7
 
-| L4 Load Balancer | L7 Load Balancer            |
-| ---------------- | --------------------------- | ----------------------------- |
-| Routes by        | IP address, Port            | URL, Headers, Cookies         |
-| TCP connections  | Passes through              | Terminates and creates new    |
-| Best for         | WebSockets, raw performance | Everything else (the default) |
-| SSL termination  | No                          | Yes                           |
-
+| L4 Load Balancer | L7 Load Balancer |
+|------------------|------------------|
+| Routes by | IP address, Port | URL, Headers, Cookies |
+| TCP connections | Passes through | Terminates and creates new |
+| Best for | WebSockets, raw performance | Everything else (the default) |
+| SSL termination | No | Yes |
 **Key phrase:**  
 “L4 routes by address, L7 routes by content.”
 
