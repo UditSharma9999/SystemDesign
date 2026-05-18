@@ -1015,15 +1015,14 @@ Every interview tip, comparison table, and key phrase from the entire Networking
 ---
 
 ## Protocol Decision Matrix
-
 ### Transport Layer: TCP vs UDP
 
-| TCP             | UDP                                           |
-| --------------- | --------------------------------------------- | ---------------------------------------------------------- |
-| Reliability     | Guaranteed delivery, in order                 | Best-effort, packets can vanish                            |
-| Speed           | Slower (handshake + tracking overhead)        | Faster (fire and forget)                                   |
-| Use when        | Correctness matters (web, APIs, files)        | Speed matters more than completeness (video, gaming, VoIP) |
-| Default choice? | Yes — use TCP unless you have a reason not to | Only for real-time where dropped data beats delayed data   |
+| TCP | UDP |
+|-----|-----|
+| Reliability | Guaranteed delivery, in order | Best-effort, packets can vanish |
+| Speed | Slower (handshake + tracking overhead) | Faster (fire and forget) |
+| Use when | Correctness matters (web, APIs, files) | Speed matters more than completeness (video, gaming, VoIP) |
+| Default choice? | Yes — use TCP unless you have a reason not to | Only for real-time where dropped data beats delayed data |
 
 **Key phrase:**  
 “TCP for everything unless we need real-time streaming where a dropped packet is better than a delayed one.”
@@ -1032,12 +1031,12 @@ Every interview tip, comparison table, and key phrase from the entire Networking
 
 ### Application Layer: REST vs GraphQL vs gRPC
 
-| REST            | GraphQL                    | gRPC                                 |
-| --------------- | -------------------------- | ------------------------------------ | -------------------------------------------- |
-| Best for        | External APIs, simple CRUD | Flexible client queries, mobile apps | Internal service-to-service, high throughput |
-| Format          | JSON over HTTP             | JSON over HTTP (single endpoint)     | Binary Protobuf                              |
-| Browser support | Native                     | Native                               | Requires proxy                               |
-| Type safety     | Manual                     | Schema-based                         | Compile-time (Protobuf)                      |
+| REST | GraphQL | gRPC |
+|------|---------|------|
+| Best for | External APIs, simple CRUD | Flexible client queries, mobile apps | Internal service-to-service, high throughput |
+| Format | JSON over HTTP | JSON over HTTP (single endpoint) | Binary Protobuf |
+| Browser support | Native | Native | Requires proxy |
+| Type safety | Manual | Schema-based | Compile-time (Protobuf) |
 
 **Key phrase:**  
 “REST for external, gRPC for internal.”
