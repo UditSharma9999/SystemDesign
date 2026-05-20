@@ -643,7 +643,8 @@ Here's how a client would use these queries:
 ```graphql
 # Get a single event with its venue and tickets
 query GetEventDetails {
-  event(id: "501") {
+  # $eventId is variables
+  event(id: $eventId) {
     name
     date
     description
@@ -676,3 +677,404 @@ query FindConcerts {
 ```
 
 The beauty here is that `GetEventDetails` asks for `description` and `capacity` while `FindConcerts` skips them entirely. Same schema, different queries, different response shapes. The mobile app can ask for less, the web app can ask for more.
+
+
+### Mutations: Writing Data
+
+If queries are `GET` requests, mutations are `POST/PUT/DELETE`. They modify data on the server:
+
+
+```GRAPHQL
+type Mutation {
+  createBooking(input: BookingInput!): BookingResult!
+  cancelBooking(bookingId: ID!): CancelResult!
+  updateEvent(id: ID!, input: UpdateEventInput!): Event!
+}
+
+input BookingInput {
+  eventId: ID!
+  ticketIds: [ID!]!
+  paymentMethodId: String!
+}
+
+input UpdateEventInput {
+  name: String
+  date: String
+  description: String
+}
+
+type BookingResult {
+  success: Boolean!
+  booking: Booking
+  error: String
+}
+
+type CancelResult {
+  success: Boolean!
+  refundAmount: Float
+  error: String
+}
+```
+#### Calling a Mutation
+```graphql
+mutation BookTickets($input: BookingInput!) {
+  createBooking(input: $input) {
+    success
+    booking {
+      id
+      confirmationCode
+      tickets {
+        section
+        row
+        seat
+      }
+      totalPrice
+    }
+    error
+  }
+}
+```
+
+```json
+{
+  "variables": {
+    "input": {
+      "eventId": "501",
+      "ticketIds": ["tkt_1001", "tkt_1002"],
+      "paymentMethodId": "pm_stripe_abc123"
+    }
+  }
+}
+```
+
+**Subscriptions** are GraphQL's mechanism for real-time data. They use WebSockets under the hood
+
+**???......**
+
+----
+
+# Chapter 7 The N+1 Problem and Other GraphQL Pitfalls
+
+
+In GraphQL, every field has a **resolver** — a function that fetches the data for that field. The server processes the query top-down:
+1. **Step 1**: The `events` resolver runs. It executes 1 database query: `SELECT * FROM events WHERE city = 'Los Angeles' LIMIT 100`. You get back 100 events.
+
+2. **Step 2**: For each of those 100 events, GraphQL calls the `venue` resolver. Each resolver sees its parent event's `venueId` and fetches the venue: `SELECT * FROM venues WHERE id = ?`.
+
+That's 100 separate database queries for venues. **Plus the 1 query for events**.
+
+**Total: 101 database queries for what looks like one simple GraphQL query.**
+
+The N+1 problem is NOT unique to GraphQL. REST can have it too. If you have a REST endpoint that returns a list of events with venueId fields, and your server-side code loops through each event to fetch its venue, you have the exact same problem.
+
+The difference is that GraphQL makes N+1 much easier to accidentally create. Here's why:
+1. In REST, the server fully controls the response structure through predefined endpoints, so data-fetching logic is optimized during API design. Since clients can only access the fixed data exposed by those endpoints, they usually cannot accidentally create inefficient database query patterns like the N+1 problem.
+2. In GraphQL, the client controls the query shape and can request deeply nested or custom combinations of fields. While this provides flexibility, it also means each resolver may fetch data independently, making it easier for new client queries to unintentionally trigger N+1 performance issues unless the server uses optimizations like batching or caching.
+
+### The Solution: DataLoader
+The standard fix for GraphQL's N+1 problem is the DataLoader pattern, originally created by Facebook (of course).
+
+The idea is simple: instead of fetching one venue at a time, collect all the venue IDs needed in a single execution tick, then batch them into one query.
+
+DataLoader does two things:
+
+1. **Batching**: Collects all .load() calls within a single tick of the event loop and fires the batch function once with all collected IDs.
+2. **Caching**: If venueId: 10 is requested twice in the same request, DataLoader returns the cached result from the first fetch. This is per-request caching, not a long-lived cache.
+
+## Caching Solutions
+- **Persisted queries** : Hash each query at build time, send the hash instead of the full query. Server maps hash → query. Can use GET requests with the hash as a URL parameter.
+
+- **Apollo Client cache** : Client-side normalized cache. Stores entities by `__typename + id` and deduplicates across queries.
+
+- **Response caching**:	Cache entire responses server-side keyed by query hash + variables.
+
+## Security: Query Depth Attacks
+In REST, you control every response.
+
+This query bounces between `Event → Venue → Event → Venue` and could generate millions of database queries and return gigabytes of data. It's essentially a denial-of-service attack through your own API.
+
+
+### Solutions
+- **Query depth limiting**:	Reject queries deeper than N levels (typically 5-10)
+
+- **Query complexity analysis**:	Assign a "cost" to each field; reject queries exceeding a total cost budget
+
+- **Rate limiting**:	Limit requests per client, but also limit total query cost per time window
+- **Timeout**	Kill query execution that exceeds a time limit
+
+## Field-Level Authorization
+In GraphQL, a single query can request both public and sensitive data together, so permissions must be checked for each field individually. This gives more flexible and fine-grained security, but also makes authorization more complex because every sensitive field needs its own access rule.
+
+## Performance Monitoring: Harder Than REST
+Monitoring REST APIs is easier because each endpoint is separate, so tools can directly track response times, errors, and performance for each route. In GraphQL, all requests usually go through a single /graphql endpoint, so different queries are mixed together and harder to analyze. Also, GraphQL often returns HTTP 200 even when part of the query fails, with errors stored inside the JSON response body, which means normal monitoring tools may miss those errors unless they specifically understand GraphQL.
+
+## Schema Evolution: Easy to Add, Hard to Remove
+Adding new fields to a GraphQL schema is trivial and backward-compatible. Existing queries don't request the new field, so they're unaffected.
+
+Removing fields is much harder. You can't just delete a field — any client still querying it will break. Instead, you deprecate it.
+
+---
+
+
+# Chapter 8 How RPC Works
+RPC is like calling someone on the phone. You dial a number, tell them exactly what you need — "Hey, get me the details for event 123" — and they do it and tell you the result. You don't care where their filing cabinet is. You just called a function and got an answer.
+
+When you write `getEvent('123')` in your code, it feels like a local function call. But a lot is happening behind the scenes to make that illusion work. Here's the step-by-step flow:
+
+```text
+Client Code                          Server Code
+     |                                    |
+     | 1. Call getEvent('123')            |
+     |        |                           |
+     |  [Client Stub]                     |
+     |   2. Serialize args                |
+     |   3. Send over network  -------->  |
+     |                              [Server Stub]
+     |                               4. Deserialize args
+     |                               5. Call real getEvent('123')
+     |                               6. Get result
+     |                               7. Serialize response
+     |                          <--------  8. Send over network
+     |  [Client Stub]                     |
+     |   9. Deserialize response          |
+     |  10. Return result                 |
+     |                                    |
+
+```
+**1. Client Stub (Proxy)** :This is auto-generated code on the client side. When you call `getEvent('123')`, you're actually calling this stub, not the real function. It acts like a fake local version of the function and handles all network work behind the scenes.
+
+**2. Serialization** : The stub converts the input (`'123'`) into a transferable format like JSON, Protocol Buffers, or XML so it can be sent over the network.
+
+**3. Network Transport**:  The request is sent to the server over the network (often via TCP or HTTP/2 in modern systems like gRPC).
+
+**4–5. Server Stub (Skeleton)**  
+   The server receives the request, converts it back into usable data (deserialization), and calls the actual `getEvent()` function, which may fetch data from a database.
+
+**6–8. Response Handling**  
+   The server gets the result, serializes it again, and sends it back over the network.
+
+**9–10. Client Receives Result**  
+   The client stub deserializes the response and returns it to your code, making it look like a normal local function call.
+
+### Key Idea
+The main advantage of RPC is that all the network complexity (serialization, transport, server execution, response handling) is hidden from the developer. You just write: 
+`result = getEvent('123')`
+
+
+You don't need RPC — your functions are all in the same process. But when you break that monolith into 50 or 500 microservices, those services need to talk to each other. A lot. With tight performance requirements.
+
+REST works great for public-facing APIs where human readability matters. But for internal service-to-service communication where:
+
+- Both sides are machines, not humans
+- You control both the client and the server
+- You need maximum performance
+- You have dozens of languages across services
+- You need strict type safety across team boundaries
+
+## REST vs. RPC: The Mental Model Comparison
+
+Here's a comprehensive comparison to cement the difference:
+
+| Aspect | REST | RPC |
+|---|---|---|
+| Mental model | "Interact with resources" | "Call remote functions" |
+| URL design | Nouns: `/events/123` | Verbs: `getEvent()` |
+| Data format | Usually JSON (text) | Varies: JSON, XML, binary (Protobuf) |
+| Coupling | Loose — client discovers resources | Tighter — client must know function signatures |
+| Best for | Public APIs, CRUD operations | Internal APIs, complex actions |
+| Human readability | High — you can test with curl | Lower — binary formats need tooling |
+| Browser support | Native | Requires special tooling |
+| Caching | Built-in HTTP caching (GET requests) | Not built-in — must implement yourself |
+| Error handling | HTTP status codes (404, 500, etc.) | Framework-specific error codes |
+| Discoverability | URLs are self-describing | Need documentation or `.proto` files |
+
+<br/>
+<br/>
+
+Think of gRPC as the modern answer to the question: "How do I make RPC that's fast, type-safe, and works across any programming language?"
+
+The answer has three parts:
+
+1. **Protocol Buffers** — A binary serialization format that's the "language" services speak
+2. **HTTP/2** — The transport protocol that carries the data
+3. **Code Generation** — Tooling that auto-generates client and server stubs from a single definition file
+
+**Protocol Buffers (Protobuf)** is a way to define both the structure of data and the available API actions in a single `.proto` file, which acts as a strict contract between client and server. It specifies what functions (RPCs) exist, what inputs they take, and what outputs they return. Both sides then generate code from this file, ensuring they always agree on the exact format. Unlike JSON, Protobuf uses numeric field IDs instead of field names when sending data, making communication much smaller and faster.
+
+**Type Safety: Catch Bugs at Compile Time**
+
+With JSON APIs, there’s no strict contract between client and server, so if the server changes something like a field name (date → event_date), the client won’t immediately know and may fail silently at runtime. This often leads to bugs that only show up in production. With Protocol Buffers in systems like gRPC, both client and server generate code from the same .proto contract, so any mismatch (like renamed or removed fields) breaks compilation. This means many integration bugs are caught early during development instead of showing up later in production.
+
+##  HTTP/2: Multiplexing and Header Compression
+Traditional REST APIs typically run over HTTP/1.1, gRPC uses HTTP/2, which provides:
+
+| Feature | HTTP/1.1 | HTTP/2 |
+|---|---|---|
+| Requests per connection | One at a time | Many in parallel (multiplexing) |
+| Header format | Text, repeated every request | Binary, compressed (HPACK) |
+| Connection overhead | New connection per request (often) | Single long-lived connection |
+| Server push | Not supported | Supported |
+
+> 💡 **Interview Tip:**  
+> If you say "gRPC is faster because it doesn't use HTTP," a knowledgeable interviewer will immediately flag this. The correct framing is: "gRPC leverages HTTP/2 for multiplexing and header compression, combined with Protocol Buffers for compact binary serialization. **The performance gain comes from both the transport efficiency and the serialization format.**"
+
+**Protocol Buffers isn't the only binary serialization format. Here's how it compares to alternatives**
+
+## (Imp) Protobuf Field Numbers and Backward Compatibility
+
+Those field numbers in `.proto` files `(= 1, = 2, etc.)` are critical for `backward compatibility`.
+
+```protobuf
+message Event {
+  string event_id = 1;
+  string name = 2;
+  string venue = 3;
+  int64 date_unix = 4;
+  // Added in v2 — old clients won't know about this field
+  string category = 5;
+  // Added in v3
+  bool is_sold_out = 6;
+}
+```
+
+Protobuf field numbers act like permanent IDs for each field, not the field names. Because of this, services stay compatible even when the data model changes.
+
+If you add a new field (like category = 5), old clients `(code)` just ignore it, and new clients can still work even if older servers don’t send it. If you remove a field, old data is still safely ignored as long as you don’t reuse its number. If you rename a field, nothing breaks because names are only used in code, not in the actual data sent over the network. The only dangerous change is changing or reusing field numbers, because that would make old and new systems interpret data incorrectly. This system lets different services evolve independently without breaking each other.
+
+
+```protobuf
+// This is SAFE — renaming doesn't change the wire format
+message Event {
+  string event_id = 1;
+  string event_name = 2;  // was "name" — field number 2 is unchanged
+}
+
+// This is DANGEROUS — never reuse or change field numbers
+message Event {
+  string event_id = 1;
+  string name = 3;  // WRONG — changed from 2 to 3, breaks all existing clients
+}
+```
+
+**The rule of thumb**: if you control both sides of the communication and you need performance or type safety, use gRPC. If your API needs to be consumed by the general public, use REST with JSON.
+
+---
+
+# Chapter 9 Streaming Patterns and When to Use gRPC
+
+## The Four gRPC Communication Patterns
+REST has one communication pattern: request in, response out. gRPC has four, and understanding when to use each one is what separates a surface-level answer from a strong one in interviews.
+
+![text13](/assets/13.png)
+
+### Pattern 1: Unary RPC (The Familiar One)
+**When to use**: Any standard request-response operation
+
+### Pattern 2: Server Streaming (The Firehose)
+The client sends a single request, and the server responds with a stream of messages.
+
+When to use:
+
+- Real-time price feeds (stocks, crypto, sports scores)
+- Live progress updates (file processing, ML model training)
+- Event logs (streaming log entries as they occur)
+- Search results delivered incrementally (return results as they're found, not all at once)
+
+
+**Why not just poll with REST?** With REST, you'd call GET /stocks/AAPL/price every second. That's 60 HTTP requests per minute, each with full headers, connection setup, and JSON parsing. With server streaming, you open one connection and the server pushes small binary updates as prices change. **Drastically less overhead**.
+
+### Pattern 3: Client Streaming (The Upload)
+The client sends a stream of messages, and the server responds with a single message after it's received everything (or enough).
+
+When to use:
+
+- File uploads in chunks
+- Sending batches of sensor/IoT data
+- Aggregating data from the client before processing (e.g., collecting GPS points for a route, then calculating the total distance)
+- Log shipping (client streams log entries, server acknowledges when batch is stored)
+
+### Pattern 4: Bidirectional Streaming (The Conversation)
+Both the client and server send streams of messages simultaneously. Neither side has to wait for the other to finish. This is full-duplex communication over a single connection.
+
+When to use:
+
+- Real-time chat applications
+- Collaborative editing (Google Docs-style)
+- Multiplayer game state synchronization
+- Interactive voice/video processing (send audio frames, receive transcription in real time)
+
+
+## Deadlines and Timeouts: gRPC's Built-In Safety Net
+One of gRPC's underrated features is deadline propagation. In a microservices architecture, a single user request might trigger a chain of internal calls:
+
+`User → API Gateway → Order Service → Payment Service → Fraud Detection`
+
+With REST, if the user's request has a 5-second timeout, each service in the chain has no idea about that deadline. The Order Service might wait 4 seconds for Payment, then Payment waits 4 seconds for Fraud Detection — and the user's request times out at the gateway while services are still working.
+
+gRPC solves this by propagating deadlines through the call chain:
+
+- Each service in the chain knows exactly how much time it has left. 
+- This is particularly important for avoiding `cascading failures`.
+
+## Load Balancing with gRPC
+
+Load balancing is harder in gRPC because it uses long-lived HTTP/2 connections instead of creating a new connection for every request like REST. In REST, each request can easily be sent to a different server, so load balancers can distribute traffic evenly. But in gRPC, one connection can carry many requests, so if a client connects to one server, all its requests may keep going to that same server, causing uneven load.
+
+**Solutions**:
+- L7 (application-level) load balancer
+- Client-side load balancing
+- service meshes which manage traffic distribution automatically.
+
+
+## gRPC-Web: Bringing gRPC to the Browser
+- Browsers can’t directly use gRPC because gRPC needs low-level HTTP/2 features (like trailers and streaming) that browser APIs such as fetch() don’t fully support. 
+- To fix this, gRPC-Web acts as a bridge: the browser sends a simplified HTTP request, then a proxy like Envoy converts it into real gRPC for the backend service. 
+- This allows web apps to still use Protobuf-based APIs, but with some trade-offs like extra latency (because of the proxy) and limited streaming support. 
+- That’s why `REST is still more common for public browser-facing` APIs, while gRPC is mostly used for backend-to-backend communication.
+
+- Client streaming and bidirectional streaming are not fully supported in all implementations 
+
+## Use gRPC When:
+1. **Internal service-to-service calls**
+2. **Polyglot environments (Go + Java + Python services)**
+3. **Streaming requirements**
+4. **High-throughput data pipelines**:	Binary serialization saves bandwidth and CPU at scale
+5. **Mobile clients on constrained networks**:	Smaller payloads = faster loads, less data usage
+
+## Do NOT Use gRPC When:
+1. **Public-facing APIs for third-party developers**
+2. **Simple CRUD applications**
+3. **Browser-first applications without a proxy**
+4. **Quick prototypes or MVPs**: JSON is simpler to debug, test, and iterate on
+5. **APIs that need human readability**
+
+
+## The Common Production Pattern: REST + gRPC
+
+
+```text
+                    Internet
+                       |
+                  [API Gateway]
+                   /        \
+            REST (JSON)    REST (JSON)
+              /                \
+    [Mobile App]          [Web Browser]
+         |                      |
+         +------→ [API Gateway] ←------+
+                       |
+                  gRPC (Protobuf)
+                 /     |      \
+        [User       [Event    [Payment
+         Service]    Service]  Service]
+              \       |        /
+          gRPC (Protobuf) internally
+                  |
+           [Notification Service]
+```
+**Public-facing layer**: REST with JSON. Browsers and mobile apps send HTTP requests with JSON bodies. Easy to debug, easy to document (OpenAPI/Swagger), easy for third-party developers.
+
+**Internal layer**: gRPC with Protocol Buffers. Services communicate with binary messages over HTTP/2. Fast, type-safe, and streamable. Teams define contracts in .proto files and generate code in whatever language they prefer.
+
+---
+
