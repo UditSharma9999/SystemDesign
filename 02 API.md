@@ -678,11 +678,9 @@ query FindConcerts {
 
 The beauty here is that `GetEventDetails` asks for `description` and `capacity` while `FindConcerts` skips them entirely. Same schema, different queries, different response shapes. The mobile app can ask for less, the web app can ask for more.
 
-
 ### Mutations: Writing Data
 
 If queries are `GET` requests, mutations are `POST/PUT/DELETE`. They modify data on the server:
-
 
 ```GRAPHQL
 type Mutation {
@@ -715,7 +713,9 @@ type CancelResult {
   error: String
 }
 ```
+
 #### Calling a Mutation
+
 ```graphql
 mutation BookTickets($input: BookingInput!) {
   createBooking(input: $input) {
@@ -751,12 +751,12 @@ mutation BookTickets($input: BookingInput!) {
 
 **???......**
 
-----
+---
 
 # Chapter 7 The N+1 Problem and Other GraphQL Pitfalls
 
-
 In GraphQL, every field has a **resolver** — a function that fetches the data for that field. The server processes the query top-down:
+
 1. **Step 1**: The `events` resolver runs. It executes 1 database query: `SELECT * FROM events WHERE city = 'Los Angeles' LIMIT 100`. You get back 100 events.
 
 2. **Step 2**: For each of those 100 events, GraphQL calls the `venue` resolver. Each resolver sees its parent event's `venueId` and fetches the venue: `SELECT * FROM venues WHERE id = ?`.
@@ -768,10 +768,12 @@ That's 100 separate database queries for venues. **Plus the 1 query for events**
 The N+1 problem is NOT unique to GraphQL. REST can have it too. If you have a REST endpoint that returns a list of events with venueId fields, and your server-side code loops through each event to fetch its venue, you have the exact same problem.
 
 The difference is that GraphQL makes N+1 much easier to accidentally create. Here's why:
+
 1. In REST, the server fully controls the response structure through predefined endpoints, so data-fetching logic is optimized during API design. Since clients can only access the fixed data exposed by those endpoints, they usually cannot accidentally create inefficient database query patterns like the N+1 problem.
 2. In GraphQL, the client controls the query shape and can request deeply nested or custom combinations of fields. While this provides flexibility, it also means each resolver may fetch data independently, making it easier for new client queries to unintentionally trigger N+1 performance issues unless the server uses optimizations like batching or caching.
 
 ### The Solution: DataLoader
+
 The standard fix for GraphQL's N+1 problem is the DataLoader pattern, originally created by Facebook (of course).
 
 The idea is simple: instead of fetching one venue at a time, collect all the venue IDs needed in a single execution tick, then batch them into one query.
@@ -782,41 +784,46 @@ DataLoader does two things:
 2. **Caching**: If venueId: 10 is requested twice in the same request, DataLoader returns the cached result from the first fetch. This is per-request caching, not a long-lived cache.
 
 ## Caching Solutions
+
 - **Persisted queries** : Hash each query at build time, send the hash instead of the full query. Server maps hash → query. Can use GET requests with the hash as a URL parameter.
 
 - **Apollo Client cache** : Client-side normalized cache. Stores entities by `__typename + id` and deduplicates across queries.
 
-- **Response caching**:	Cache entire responses server-side keyed by query hash + variables.
+- **Response caching**: Cache entire responses server-side keyed by query hash + variables.
 
 ## Security: Query Depth Attacks
+
 In REST, you control every response.
 
 This query bounces between `Event → Venue → Event → Venue` and could generate millions of database queries and return gigabytes of data. It's essentially a denial-of-service attack through your own API.
 
-
 ### Solutions
-- **Query depth limiting**:	Reject queries deeper than N levels (typically 5-10)
 
-- **Query complexity analysis**:	Assign a "cost" to each field; reject queries exceeding a total cost budget
+- **Query depth limiting**: Reject queries deeper than N levels (typically 5-10)
 
-- **Rate limiting**:	Limit requests per client, but also limit total query cost per time window
-- **Timeout**	Kill query execution that exceeds a time limit
+- **Query complexity analysis**: Assign a "cost" to each field; reject queries exceeding a total cost budget
+
+- **Rate limiting**: Limit requests per client, but also limit total query cost per time window
+- **Timeout** Kill query execution that exceeds a time limit
 
 ## Field-Level Authorization
+
 In GraphQL, a single query can request both public and sensitive data together, so permissions must be checked for each field individually. This gives more flexible and fine-grained security, but also makes authorization more complex because every sensitive field needs its own access rule.
 
 ## Performance Monitoring: Harder Than REST
+
 Monitoring REST APIs is easier because each endpoint is separate, so tools can directly track response times, errors, and performance for each route. In GraphQL, all requests usually go through a single /graphql endpoint, so different queries are mixed together and harder to analyze. Also, GraphQL often returns HTTP 200 even when part of the query fails, with errors stored inside the JSON response body, which means normal monitoring tools may miss those errors unless they specifically understand GraphQL.
 
 ## Schema Evolution: Easy to Add, Hard to Remove
+
 Adding new fields to a GraphQL schema is trivial and backward-compatible. Existing queries don't request the new field, so they're unaffected.
 
 Removing fields is much harder. You can't just delete a field — any client still querying it will break. Instead, you deprecate it.
 
 ---
 
-
 # Chapter 8 How RPC Works
+
 RPC is like calling someone on the phone. You dial a number, tell them exactly what you need — "Hey, get me the details for event 123" — and they do it and tell you the result. You don't care where their filing cabinet is. You just called a function and got an answer.
 
 When you write `getEvent('123')` in your code, it feels like a local function call. But a lot is happening behind the scenes to make that illusion work. Here's the step-by-step flow:
@@ -841,25 +848,26 @@ Client Code                          Server Code
      |                                    |
 
 ```
+
 **1. Client Stub (Proxy)** :This is auto-generated code on the client side. When you call `getEvent('123')`, you're actually calling this stub, not the real function. It acts like a fake local version of the function and handles all network work behind the scenes.
 
 **2. Serialization** : The stub converts the input (`'123'`) into a transferable format like JSON, Protocol Buffers, or XML so it can be sent over the network.
 
-**3. Network Transport**:  The request is sent to the server over the network (often via TCP or HTTP/2 in modern systems like gRPC).
+**3. Network Transport**: The request is sent to the server over the network (often via TCP or HTTP/2 in modern systems like gRPC).
 
 **4–5. Server Stub (Skeleton)**  
-   The server receives the request, converts it back into usable data (deserialization), and calls the actual `getEvent()` function, which may fetch data from a database.
+ The server receives the request, converts it back into usable data (deserialization), and calls the actual `getEvent()` function, which may fetch data from a database.
 
 **6–8. Response Handling**  
-   The server gets the result, serializes it again, and sends it back over the network.
+ The server gets the result, serializes it again, and sends it back over the network.
 
 **9–10. Client Receives Result**  
-   The client stub deserializes the response and returns it to your code, making it look like a normal local function call.
+ The client stub deserializes the response and returns it to your code, making it look like a normal local function call.
 
 ### Key Idea
-The main advantage of RPC is that all the network complexity (serialization, transport, server execution, response handling) is hidden from the developer. You just write: 
-`result = getEvent('123')`
 
+The main advantage of RPC is that all the network complexity (serialization, transport, server execution, response handling) is hidden from the developer. You just write:
+`result = getEvent('123')`
 
 You don't need RPC — your functions are all in the same process. But when you break that monolith into 50 or 500 microservices, those services need to talk to each other. A lot. With tight performance requirements.
 
@@ -875,18 +883,18 @@ REST works great for public-facing APIs where human readability matters. But for
 
 Here's a comprehensive comparison to cement the difference:
 
-| Aspect | REST | RPC |
-|---|---|---|
-| Mental model | "Interact with resources" | "Call remote functions" |
-| URL design | Nouns: `/events/123` | Verbs: `getEvent()` |
-| Data format | Usually JSON (text) | Varies: JSON, XML, binary (Protobuf) |
-| Coupling | Loose — client discovers resources | Tighter — client must know function signatures |
-| Best for | Public APIs, CRUD operations | Internal APIs, complex actions |
-| Human readability | High — you can test with curl | Lower — binary formats need tooling |
-| Browser support | Native | Requires special tooling |
-| Caching | Built-in HTTP caching (GET requests) | Not built-in — must implement yourself |
-| Error handling | HTTP status codes (404, 500, etc.) | Framework-specific error codes |
-| Discoverability | URLs are self-describing | Need documentation or `.proto` files |
+| Aspect            | REST                                 | RPC                                            |
+| ----------------- | ------------------------------------ | ---------------------------------------------- |
+| Mental model      | "Interact with resources"            | "Call remote functions"                        |
+| URL design        | Nouns: `/events/123`                 | Verbs: `getEvent()`                            |
+| Data format       | Usually JSON (text)                  | Varies: JSON, XML, binary (Protobuf)           |
+| Coupling          | Loose — client discovers resources   | Tighter — client must know function signatures |
+| Best for          | Public APIs, CRUD operations         | Internal APIs, complex actions                 |
+| Human readability | High — you can test with curl        | Lower — binary formats need tooling            |
+| Browser support   | Native                               | Requires special tooling                       |
+| Caching           | Built-in HTTP caching (GET requests) | Not built-in — must implement yourself         |
+| Error handling    | HTTP status codes (404, 500, etc.)   | Framework-specific error codes                 |
+| Discoverability   | URLs are self-describing             | Need documentation or `.proto` files           |
 
 <br/>
 <br/>
@@ -905,15 +913,16 @@ The answer has three parts:
 
 With JSON APIs, there’s no strict contract between client and server, so if the server changes something like a field name (date → event_date), the client won’t immediately know and may fail silently at runtime. This often leads to bugs that only show up in production. With Protocol Buffers in systems like gRPC, both client and server generate code from the same .proto contract, so any mismatch (like renamed or removed fields) breaks compilation. This means many integration bugs are caught early during development instead of showing up later in production.
 
-##  HTTP/2: Multiplexing and Header Compression
+## HTTP/2: Multiplexing and Header Compression
+
 Traditional REST APIs typically run over HTTP/1.1, gRPC uses HTTP/2, which provides:
 
-| Feature | HTTP/1.1 | HTTP/2 |
-|---|---|---|
-| Requests per connection | One at a time | Many in parallel (multiplexing) |
-| Header format | Text, repeated every request | Binary, compressed (HPACK) |
-| Connection overhead | New connection per request (often) | Single long-lived connection |
-| Server push | Not supported | Supported |
+| Feature                 | HTTP/1.1                           | HTTP/2                          |
+| ----------------------- | ---------------------------------- | ------------------------------- |
+| Requests per connection | One at a time                      | Many in parallel (multiplexing) |
+| Header format           | Text, repeated every request       | Binary, compressed (HPACK)      |
+| Connection overhead     | New connection per request (often) | Single long-lived connection    |
+| Server push             | Not supported                      | Supported                       |
 
 > 💡 **Interview Tip:**  
 > If you say "gRPC is faster because it doesn't use HTTP," a knowledgeable interviewer will immediately flag this. The correct framing is: "gRPC leverages HTTP/2 for multiplexing and header compression, combined with Protocol Buffers for compact binary serialization. **The performance gain comes from both the transport efficiency and the serialization format.**"
@@ -941,7 +950,6 @@ Protobuf field numbers act like permanent IDs for each field, not the field name
 
 If you add a new field (like category = 5), old clients `(code)` just ignore it, and new clients can still work even if older servers don’t send it. If you remove a field, old data is still safely ignored as long as you don’t reuse its number. If you rename a field, nothing breaks because names are only used in code, not in the actual data sent over the network. The only dangerous change is changing or reusing field numbers, because that would make old and new systems interpret data incorrectly. This system lets different services evolve independently without breaking each other.
 
-
 ```protobuf
 // This is SAFE — renaming doesn't change the wire format
 message Event {
@@ -963,14 +971,17 @@ message Event {
 # Chapter 9 Streaming Patterns and When to Use gRPC
 
 ## The Four gRPC Communication Patterns
+
 REST has one communication pattern: request in, response out. gRPC has four, and understanding when to use each one is what separates a surface-level answer from a strong one in interviews.
 
 ![text13](/assets/13.png)
 
 ### Pattern 1: Unary RPC (The Familiar One)
+
 **When to use**: Any standard request-response operation
 
 ### Pattern 2: Server Streaming (The Firehose)
+
 The client sends a single request, and the server responds with a stream of messages.
 
 When to use:
@@ -980,10 +991,10 @@ When to use:
 - Event logs (streaming log entries as they occur)
 - Search results delivered incrementally (return results as they're found, not all at once)
 
-
 **Why not just poll with REST?** With REST, you'd call GET /stocks/AAPL/price every second. That's 60 HTTP requests per minute, each with full headers, connection setup, and JSON parsing. With server streaming, you open one connection and the server pushes small binary updates as prices change. **Drastically less overhead**.
 
 ### Pattern 3: Client Streaming (The Upload)
+
 The client sends a stream of messages, and the server responds with a single message after it's received everything (or enough).
 
 When to use:
@@ -994,6 +1005,7 @@ When to use:
 - Log shipping (client streams log entries, server acknowledges when batch is stored)
 
 ### Pattern 4: Bidirectional Streaming (The Conversation)
+
 Both the client and server send streams of messages simultaneously. Neither side has to wait for the other to finish. This is full-duplex communication over a single connection.
 
 When to use:
@@ -1003,8 +1015,8 @@ When to use:
 - Multiplayer game state synchronization
 - Interactive voice/video processing (send audio frames, receive transcription in real time)
 
-
 ## Deadlines and Timeouts: gRPC's Built-In Safety Net
+
 One of gRPC's underrated features is deadline propagation. In a microservices architecture, a single user request might trigger a chain of internal calls:
 
 `User → API Gateway → Order Service → Payment Service → Fraud Detection`
@@ -1013,7 +1025,7 @@ With REST, if the user's request has a 5-second timeout, each service in the cha
 
 gRPC solves this by propagating deadlines through the call chain:
 
-- Each service in the chain knows exactly how much time it has left. 
+- Each service in the chain knows exactly how much time it has left.
 - This is particularly important for avoiding `cascading failures`.
 
 ## Load Balancing with gRPC
@@ -1021,36 +1033,37 @@ gRPC solves this by propagating deadlines through the call chain:
 Load balancing is harder in gRPC because it uses long-lived HTTP/2 connections instead of creating a new connection for every request like REST. In REST, each request can easily be sent to a different server, so load balancers can distribute traffic evenly. But in gRPC, one connection can carry many requests, so if a client connects to one server, all its requests may keep going to that same server, causing uneven load.
 
 **Solutions**:
+
 - L7 (application-level) load balancer
 - Client-side load balancing
 - service meshes which manage traffic distribution automatically.
 
-
 ## gRPC-Web: Bringing gRPC to the Browser
-- Browsers can’t directly use gRPC because gRPC needs low-level HTTP/2 features (like trailers and streaming) that browser APIs such as fetch() don’t fully support. 
-- To fix this, gRPC-Web acts as a bridge: the browser sends a simplified HTTP request, then a proxy like Envoy converts it into real gRPC for the backend service. 
-- This allows web apps to still use Protobuf-based APIs, but with some trade-offs like extra latency (because of the proxy) and limited streaming support. 
+
+- Browsers can’t directly use gRPC because gRPC needs low-level HTTP/2 features (like trailers and streaming) that browser APIs such as fetch() don’t fully support.
+- To fix this, gRPC-Web acts as a bridge: the browser sends a simplified HTTP request, then a proxy like Envoy converts it into real gRPC for the backend service.
+- This allows web apps to still use Protobuf-based APIs, but with some trade-offs like extra latency (because of the proxy) and limited streaming support.
 - That’s why `REST is still more common for public browser-facing` APIs, while gRPC is mostly used for backend-to-backend communication.
 
-- Client streaming and bidirectional streaming are not fully supported in all implementations 
+- Client streaming and bidirectional streaming are not fully supported in all implementations
 
 ## Use gRPC When:
+
 1. **Internal service-to-service calls**
 2. **Polyglot environments (Go + Java + Python services)**
 3. **Streaming requirements**
-4. **High-throughput data pipelines**:	Binary serialization saves bandwidth and CPU at scale
-5. **Mobile clients on constrained networks**:	Smaller payloads = faster loads, less data usage
+4. **High-throughput data pipelines**: Binary serialization saves bandwidth and CPU at scale
+5. **Mobile clients on constrained networks**: Smaller payloads = faster loads, less data usage
 
 ## Do NOT Use gRPC When:
+
 1. **Public-facing APIs for third-party developers**
 2. **Simple CRUD applications**
 3. **Browser-first applications without a proxy**
 4. **Quick prototypes or MVPs**: JSON is simpler to debug, test, and iterate on
 5. **APIs that need human readability**
 
-
 ## The Common Production Pattern: REST + gRPC
-
 
 ```text
                     Internet
@@ -1072,9 +1085,394 @@ Load balancing is harder in gRPC because it uses long-lived HTTP/2 connections i
                   |
            [Notification Service]
 ```
+
 **Public-facing layer**: REST with JSON. Browsers and mobile apps send HTTP requests with JSON bodies. Easy to debug, easy to document (OpenAPI/Swagger), easy for third-party developers.
 
 **Internal layer**: gRPC with Protocol Buffers. Services communicate with binary messages over HTTP/2. Fast, type-safe, and streamable. Teams define contracts in .proto files and generate code in whatever language they prefer.
 
 ---
 
+# Chapter 10 Pagination
+
+## Offset-based pagination
+
+It is like browsing pages in a book or shopping website. Instead of loading all data at once, the API gives a small chunk at a time. For example, offset=20&limit=10 means “skip the first 20 items and show the next 10.” This helps apps load faster and avoids overwhelming the server.
+
+- Simple to implement
+- Random page access: Users can jump to page 5, page 50, page 500
+- Easy to calculate total pages
+
+#### The Data Shift Problem (This Is What Breaks It)
+
+You're browsing a list of events sorted by newest first. You load page 1 (items 1-10). While you're reading page 1, someone publishes a new event. That new event becomes item 1 in the database.
+
+Now you request page 2 (offset=10&limit=10). What happens?
+
+Every existing record shifted down by one position. The item that was at position 10 (last on your page 1) is now at position 11 (first on page 2). **You see it again**.
+
+#### Performance at Scale
+
+Offset pagination also becomes slow with huge databases. If you ask for OFFSET 1000000, the database must first scan through and skip one million rows before returning the next results. It doesn’t directly jump to row 1,000,000. So as the offset grows, queries take longer and use more resources, making performance worse on large datasets.
+
+## Cursor-Based Pagination: Stable Under Chaos
+
+Cursor-based pagination works like a bookmark. Instead of saying “skip 100 records,” the client says, “start after this last record I already saw.” The server sends a cursor (a hidden token) with each response, and the client uses it to fetch the next set of data. This is faster because the database can jump directly to the correct position using indexes instead of scanning thousands or millions of rows. It also avoids duplicates and missing records when new data is added while users are browsing.
+
+```SQL
+-- Let's say the cursor decodes to {"id": 123}:
+SELECT * FROM events
+WHERE id < 123
+ORDER BY id DESC
+LIMIT 10;
+```
+
+**The response includes the next cursor:**
+
+```JSON
+{
+  "data": [ ... ],
+  "pagination": {
+    "next_cursor": "eyJpZCI6MTEzfQ==",
+    "has_more": true
+  }
+}
+```
+
+#### Why It's Stable Under Writes (data shift scenario)
+
+Cursor pagination stays reliable even when new data is added. If you already saw items A–E, the cursor remembers “start after E.” Even if a new item Z is inserted at the top, your next request still correctly returns F–J. Nothing gets duplicated or skipped because the cursor tracks a specific record, not a changing row position.
+
+**Can Cursors Use Non-ID Fields?** :Yes. Cursors can reference any field, as long as it produces a unique, stable ordering. Common choices:
+
+| Cursor Field                   | Works? | Notes                                                       |
+| ------------------------------ | ------ | ----------------------------------------------------------- |
+| Auto-incrementing ID           | Yes    | Natural order, unique, perfect                              |
+| Created timestamp              | Yes    | Add a tiebreaker (ID) for records with identical timestamps |
+| Composite key (timestamp + ID) | Yes    | Most robust approach for sorted feeds                       |
+| Name (alphabetical)            | Risky  | Not unique — multiple records named "John" break it         |
+| Random field                   | No     | No stable ordering                                          |
+
+### Cursor Edge Cases
+
+#### What if a new record is inserted before the cursor?
+
+If you're scrolling through a feed and someone publishes a new post above where you are, your pagination continues forward without ever fetching it. This is usually fine for feeds — the client can "pull to refresh" to see new content at the top.
+
+#### What if the cursor record is deleted?
+
+This depends on your implementation. Two common approaches:
+
+1. **Use the next valid record**: If the cursor pointed to record 123 and it's been deleted, find the nearest record that still exists and start from there. This is the most robust approach.
+2. **Return an error**: Tell the client the cursor is invalid and they should start over. Simpler, but worse UX.
+
+### Keyset Pagination: Cursor's Under-the-Hood Sibling
+
+Keyset pagination is the database technique: using a `WHERE` clause to filter by the last-seen key instead of using `OFFSET`. Cursor pagination is the API pattern built on top of it: encoding that key into an opaque token and passing it between client and server.
+
+**Avoid paginating inside another paginated list**. For example, if posts are paginated and each post’s comments are also paginated, the client must track pagination state for every single post, which becomes complex and buggy when data changes.
+
+A better approach is:
+
+- Show only a few comments inline (like the top 3) with a “view all comments” option, or
+- Paginate only one level at a time — fetch paginated posts first, then load comments separately when needed.
+
+## When to Use Which
+
+### Use offset when:
+
+- Data doesn't change frequently (archival data, reports)
+- Users need to jump to specific pages (admin dashboards, search results)
+- Dataset is small enough that high-offset performance isn't a concern
+- You need a "total results" count
+
+### Use cursor when:
+
+- Data changes frequently (social feeds, notifications, chat messages)
+- Users scroll linearly (infinite scroll, "load more" buttons)
+- Dataset is large and performance matters
+- Consistency matters more than random page access
+
+### Use both:
+
+- Some APIs offer both. The `/events` endpoint might support cursor for the mobile app's infinite scroll and offset for the admin dashboard's page-numbered table. Same data, different access patterns.
+
+---
+
+# Chapter 11 Versioning and API Compatibility
+
+API versioning is like updating a restaurant menu without breaking delivery apps that still use the old one. Instead of replacing everything instantly, you create a new version while keeping the old version working for some time. This lets clients switch gradually without errors or downtime. In APIs, versioning helps developers safely change endpoints, data structures, or features without breaking existing applications.
+
+| Change                                | Breaking? | Needs New Version? |
+| ------------------------------------- | --------- | ------------------ |
+| Add a new field to response           | No        | No                 |
+| Add a new optional query parameter    | No        | No                 |
+| Add a new endpoint                    | No        | No                 |
+| Remove a field from response          | Yes       | Yes                |
+| Rename a field                        | Yes       | Yes                |
+| Change a field's type (string to int) | Yes       | Yes                |
+| Make an optional field required       | Yes       | Yes                |
+| Change the URL structure              | Yes       | Yes                |
+
+> The pattern: **adding is safe, removing/changing is dangerous**.
+
+## The Four Versioning Strategies
+
+### 1. URL Versioning (The Most Common)
+
+The version lives right in the URL:
+
+    GET /v1/events/123
+    GET /v2/events/123
+
+| Pros                                                        | Cons                                                                     |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Impossible to miss                                          | URL pollution — every endpoint now has a version prefix                  |
+| Easy to test                                                | Harder to sunset — removing v1 requires updating all clients             |
+| Easy to route — gateways can split `/v1/` and `/v2/` easily | Philosophical objection — version shouldn’t define the resource identity |
+| Simple mental model — “v1 is old, v2 is new”                |                                                                          |
+
+### 2. Header Versioning
+
+The version is passed in a custom HTTP header:
+
+    GET /events/123
+    Accept-Version: v2
+
+| Pros                                                                  | Cons                                                  |
+| --------------------------------------------------------------------- | ----------------------------------------------------- |
+| Clean URLs — resource path stays pure (/events/123)                   | Less visible — version isn’t obvious from the URL     |
+| Follows HTTP conventions — headers are the correct place for metadata | Harder to test — requires curl/Postman to set headers |
+| Date-based versioning (e.g., Stripe-style) makes evolution clear      | Easy to forget — clients may omit the version header  |
+
+### 3. Query Parameter Versioning
+
+The version is a query parameter:
+
+    GET /events/123?version=2
+
+This is a middle ground — visible in the URL but not baked into the path structure. It's less common and generally considered less clean than the other approaches.
+
+### 4. Content Negotiation
+
+The version is part of the `Accept` header's media type:
+
+    GET /events/123
+    Accept: application/vnd.myapi.v2+json
+
+This is the most "RESTful" approach according to purists, but it's rarely used in practice because it's cumbersome and unfamiliar to most developers.
+
+> 💡 **Interview Tip:**  
+> URL versioning is the safe default in interviews. It's the most widely understood, the easiest to explain, and no interviewer will question it. If asked "why not headers?", say: "URL versioning is more explicit, easier to test, and simpler to route at the infrastructure level.
+
+## Forward Compatibility: Designing APIs That Don't Break
+
+- Forward compatibility means designing an API so future changes don’t break older clients. One key rule is to use enums instead of booleans, because booleans only allow two states, but real systems often grow more states over time. For example, instead of is_active: true/false, use status: "active", which can later expand to "inactive", "suspended", or more without breaking existing clients.
+
+- Another important practice is to keep new fields optional, so older clients don’t break when they don’t send them. The server can safely use default values.
+
+- Finally, prefer additive changes over modifications. Instead of changing or removing existing fields or behavior, add new fields, new endpoints, or optional parameters. This way, old clients keep working while new clients can adopt improved features gradually.
+
+## Backward Compatibility: Old Clients Still Work
+
+Backward compatibility means your new API should not break apps that were built using the old version. You can safely add new fields, endpoints, or optional parameters, and also expand allowed values without affecting existing clients.
+
+But things like removing fields, renaming them, changing data types, or making optional fields required will break old clients and should be avoided or handled carefully.
+
+When breaking changes are unavoidable, you use a `deprecation strategy`: warn users in advance, support both old and new versions together, set a sunset date, and track usage before removing the old version.
+
+A good structure like semantic versioning helps manage this `(major (v1 to v2) = breaking changes, minor (v1.1) = new features, patch (v1.1.1) = fixes)`.
+
+## HATEOAS (Hypermedia as the Engine of Application State)
+
+HATEOAS is a way of designing APIs where the server tells the client what it can do next by including links inside the response. Instead of the client memorizing endpoints like “POST /events/123/cancel,” it simply follows the links provided by the API.
+
+For example, an event response might include links for viewing itself, canceling it, or checking tickets. If an action isn’t allowed (like canceling a finished event), the API just doesn’t include that link, so the client automatically knows it’s not possible.
+
+Most modern APIs skip HATEOAS because it adds extra complexity and isn’t very useful when the frontend already knows the API structure. But it’s becoming interesting again for AI agents, since they don’t rely on hardcoded endpoints and can “navigate” an API just by following the links provided in responses.
+
+---
+
+# Chapter 12 Filtering, Sorting, and Search Patterns
+
+## Filtering: Narrowing Results
+
+### 1. Simple Equality Filters
+
+The most basic pattern: a query parameter matches a field value exactly.
+
+    GET /events?city=NYC
+    GET /events?category=music
+    GET /events?city=NYC&category=music
+
+Each parameter maps to a WHERE clause:
+
+```sql
+SELECT * FROM events WHERE city = 'NYC' AND category = 'music';
+```
+
+### 2. Range Filters
+
+    GET /events?date_from=2024-01-01&date_to=2024-12-31
+    GET /events?price_min=20&price_max=100
+
+| Pattern                 | Example              | Notes                                                    |
+| ----------------------- | -------------------- | -------------------------------------------------------- |
+| field_from / field_to   | date_from=2024-01-01 | Clear, explicit                                          |
+| field_min / field_max   | price_min=20         | Good for numeric ranges                                  |
+| field_gte / field_lte   | date_gte=2024-01-01  | Mirrors database operators (gte = greater than or equal) |
+| field[gte] / field[lte] | date[gte]=2024-01-01 | Bracket notation, used by Stripe                         |
+
+Pick one convention and use it everywhere. Don't use date_from on one endpoint and created_gte on another. Inconsistency is the fastest way to frustrate developers integrating with your API.
+
+### 3. Multiple Values (IN Filters)
+
+When a client wants records matching any of several values:
+
+`GET /events?category=music,sports,theater`
+
+```sql
+SELECT * FROM events WHERE category IN ('music', 'sports', 'theater');
+```
+
+Some APIs use repeated parameters instead:
+
+`GET /events?category=music&category=sports&category=theater`  
+Both work. The comma-separated approach is more concise
+
+### 4. Nested Filters (Dot Notation)
+
+    GET /events?venue.city=NYC
+    GET /orders?customer.tier=premium
+
+```SQL
+SELECT events.* FROM events
+JOIN venues ON events.venue_id = venues.id
+WHERE venues.city = 'NYC';
+```
+
+**Consistency Is Everything** : The most important rule is consistency. If one endpoint uses city=NYC or date_from, every other endpoint should follow the same pattern. If different endpoints behave differently, it becomes confusing and hard for developers to use the API correctly.
+
+## Sorting: Controlling Order
+
+### 1. Basic Sorting
+
+    GET /events?sort=date&order=asc
+    GET /events?sort=price&order=desc
+
+### 2. Multiple Sort Fields
+
+    GET /events?sort=-date,name
+
+```SQL
+SELECT * FROM events ORDER BY date DESC, name ASC;
+```
+
+**Only Allow Sorting on Indexed Fields** : Sorting on a non-indexed field forces a full table scan. If your `events` table has 10 million rows and someone requests `?sort=description`, the database has to read every row and sort them by description text. This can take seconds or even minutes.
+
+## Search: Finding Items by Text
+
+### 1. Basic Search
+
+    GET /events?q=concert+NYC
+
+```slq
+SELECT * FROM events
+WHERE to_tsvector(name || ' ' || description || ' ' || city)
+      @@ to_tsquery('concert & NYC');
+```
+
+The `q` parameter is the universal convention for search queries
+
+#### When to Use a Dedicated Search Endpoint
+
+For simple search, a q parameter on the list endpoint works fine. But when search becomes complex — with autocomplete, facets, highlighting, relevance scoring — a dedicated endpoint is cleaner:
+
+    GET /events/search?q=concert+NYC&autocomplete=true
+
+This separates the "browse events" use case (list endpoint with filters) from the "find events" use case (search endpoint with text matching). Different backend optimizations, different response formats.
+
+## Combining Everything: Filter, Sort, Search, Paginate
+
+    GET /events?city=NYC&category=music&sort=-date&limit=20&cursor=abc123
+
+This says: "Give me music events in NYC, sorted by newest first, 20 at a time, starting after this cursor."
+
+Order of Operations
+
+The server processes these in a specific order:
+
+- **Filter** — narrow down to matching records (WHERE city='NYC' AND category='music')
+- **Search** — if a q parameter is present, apply text matching
+- **Sort** — order the filtered results (ORDER BY date DESC)
+- **Paginate** — slice the sorted results (LIMIT 20 with cursor)
+
+**This order matters.**
+
+## Batch Operations: Processing Many Items at Once
+
+Sometimes clients need to create, update, or delete many records at once. Making 100 individual API calls is slow and wasteful. Batch endpoints let clients send them all in one request.
+
+What happens when you send 100 items in a batch and 3 of them fail? This is where most APIs get it wrong.
+
+- **Bad approach 1**: Return 500 for the entire batch. The client has no idea what succeeded and what didn't. If they retry, the 97 successful items might get duplicated.
+
+- **Bad approach 2**: Return 200 and silently drop the failures. The client thinks everything succeeded. Data is quietly lost.
+
+- **Good approach**: Return a **structured partial-success** response that clearly indicates the outcome for each item:
+
+```JSON
+{
+  "status": "partial_success",
+  "summary": {
+    "total": 100,
+    "succeeded": 97,
+    "failed": 3
+  },
+  "results": [
+    { "index": 0, "status": "success", "id": 1001 },
+    { "index": 1, "status": "success", "id": 1002 },
+    {
+      "index": 2,
+      "status": "error",
+      "error": {
+        "code": "VALIDATION_ERROR",
+        "message": "Date must be in the future",
+        "field": "date",
+        "retryable": false
+      }
+    },
+    .....
+  ]
+}
+```
+
+**Retryable flag** — tells the client whether retrying would help.
+
+**HTTP status code** — use `207 Multi-Status for partial success`
+
+**Expansion / Embedding: Inline Related Resources** : sometimes the client wants more data in a single request.
+
+    GET /events/123          → { "name": "Concert", "venue_id": 456 }
+    GET /venues/456          → { "name": "Madison Square Garden", "city": "NYC" }
+
+with With expansion, one call does it:
+
+    GET /events/123?expand=venue
+
+Allow expanding direct relationships but limit the depth. `?expand=venue` is fine. `?expand=venue.city.country.continent` is a database nightmare.
+
+---
+
+#### OData (Open Data Protocol)
+
+A standardized query language for REST APIs used heavily in Azure, Microsoft Graph, SAP, and Dynamics 365.
+
+OData uses a `$` prefix convention for query operators:
+
+    GET /products?$filter=price gt 100 and category  'electronics'
+                  &$select=name,price
+                  &$orderby=price desc
+                  &$top=20
+                  &$skip=40
+
+---
