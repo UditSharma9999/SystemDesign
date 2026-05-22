@@ -1529,9 +1529,12 @@ HTTP caching is a way to make apps and websites faster by avoiding unnecessary d
 The server controls caching using the **Cache-Control header**.  
 For example, **max-age=600** means the client can use the cached response for `600 seconds (10 minutes)` without contacting the server again. During that time, the app can instantly show the stored data instead of downloading it again.
 
-**private** : directive means only the user’s device can cache the response.  
-**public** : means shared systems like CDNs and proxy servers can cache it too.  
-**no-store** : Never cache this response at all  
+**private** : directive means only the user’s device can cache the response.
+
+**public** : means shared systems like CDNs and proxy servers can cache it too.
+
+**no-store** : Never cache this response at all
+
 **no-cache** : You can cache it, but must revalidate with the server before using it.
 
 > `No-cache`: ("It means the client may store the response, but before using it again, it must first check with the server to confirm the data is still up to date.")
@@ -1762,8 +1765,9 @@ Many developers think the choice is:
 
 - Option A: Use API keys
 - Option B: Use JWTs
-- Option C: Use OAuth 2.0  
-  But that's wrong. OAuth 2.0 is Option A + Option B working together with a defined flow.
+- Option C: Use OAuth 2.0
+
+But that's wrong. OAuth 2.0 is Option A + Option B working together with a defined flow.
 
 ### How OAuth 2.0 Works (Client Credentials Flow)
 
