@@ -1476,3 +1476,337 @@ OData uses a `$` prefix convention for query operators:
                   &$skip=40
 
 ---
+
+# Chapter 13 Async Operations, Caching, and Optimistic Concurrency
+
+Some tasks in an application take a long time to finish, such as generating large reports.
+
+If the server makes the user wait until the task is fully completed, the request might time out and the user may think something went wrong. They could even click the button again, accidentally starting the same process twice.
+
+To avoid this, APIs use asynchronous operations, where the server accepts the request first and completes the work in the background.
+
+## 202 Accepted + status polling
+
+The common solution is called the **“202 Accepted + status polling”** pattern. When the client sends a request, the server immediately responds with `202 Accepted` instead of waiting for the task to finish. This response means, `“I received your request and I’ll process it soon.”` Along with this, the server returns a job ID and a status URL. The job ID uniquely identifies the background task, while the status URL is an endpoint the client can repeatedly check to see how the work is progressing or can use `Estimated completion time`.
+
+After that, the client periodically sends requests to the status endpoint. If the task is still running, the server responds with information such as "processing" and maybe a progress percentage like 65%. This helps the frontend show loading indicators or progress bars to the user.
+
+Once the task is complete, the server responds with the final result or redirects the client to the completed resource using `303 See` Other and a `Location header`. If something goes wrong, the status endpoint returns a "failed" status along with an error message explaining the problem.
+
+### Alternatives to Polling
+
+Polling works but wastes requests. Better options exist:
+
+- Webhooks
+- WebSockets
+- SSE
+
+## ETags and Optimistic Concurrency
+
+ETags and optimistic concurrency are used to prevent people from accidentally overwriting each other’s changes when multiple users edit the same data at the same time. Imagine two people opening the same document. Both see the original version, make different edits, and save their changes. Without protection, the second save would overwrite the first one, causing the first person’s work to be lost. This problem is called a lost update.
+
+### Solution : ETag
+
+APIs use something called an `ETag (Entity Tag)`. An ETag is like a version fingerprint for a resource. Whenever the resource changes, the ETag also changes. For example, when a client requests a document, the server sends both the document data and an ETag value such as `"a1b2c3d4"`. The client stores this ETag along with the data it received.
+
+Later, when the client wants to update the document, it sends the ETag back using the **If-Match header**. This tells the server: `“Only save my changes if the document is still the same version I originally fetched.”` The server then compares the provided ETag with the current one stored on the server.
+
+If the ETags match, it means nobody else changed the document in the meantime, so the update is safe and the server saves it. After saving, the server generates a new ETag because the content has changed. But if the ETags do not match, it means someone else already updated the document. In that case, the server rejects the request with **412 Precondition Failed**. This prevents accidental overwriting and tells the client to fetch the latest version before trying again.
+
+This works very well for APIs because it avoids locks, improves performance, keeps the server stateless, and still protects data from accidental overwrites.
+
+There are also two kinds of ETags.
+
+1. **Strong ETag** changes whenever even a tiny part of the content changes, making it ideal when exact matching is required.
+2. weak ETag only checks whether the content is semantically similar, even if formatting differs.
+
+Most APIs prefer strong ETags because they are simpler and safer.
+
+## HTTP Caching
+
+HTTP caching is a way to make apps and websites faster by avoiding unnecessary data downloads. Imagine a mobile app that shows event details. Every time the user opens the event page, the app sends a request to the server like GET /events/123. If the event information has not changed, sending the same data again wastes internet bandwidth and server resources.
+
+The server controls caching using the **Cache-Control header**.  
+For example, **max-age=600** means the client can use the cached response for `600 seconds (10 minutes)` without contacting the server again. During that time, the app can instantly show the stored data instead of downloading it again.
+
+**private** : directive means only the user’s device can cache the response.  
+**public** : means shared systems like CDNs and proxy servers can cache it too.  
+**no-store** : Never cache this response at all  
+**no-cache** : You can cache it, but must revalidate with the server before using it.
+
+> `No-cache`: ("It means the client may store the response, but before using it again, it must first check with the server to confirm the data is still up to date.")
+
+To check whether cached data has changed, HTTP uses **ETags** such as `"abc123"`. when the cache expires, the client sends the ETag back using the **If-None-Match header**. This asks the server, `“Has this data changed since version abc123?”`
+
+If the data has not changed, the server replies with **304 Not Modified**. This response contains no actual data because the client already has it cached locally. The client simply reuses the stored copy, saving bandwidth and improving speed. If the data has changed, the server sends a normal **200 OK response** with updated data and a new ETag. The client then replaces the old cached version with the new one.
+
+### Caching Strategy by Resource Type
+
+| Resource Type                 | Cache Strategy             | Why                                       |
+| ----------------------------- | -------------------------- | ----------------------------------------- |
+| Static assets (images, CSS)   | `public, max-age=31536000` | Rarely change, safe to cache aggressively |
+| User-specific data            | `private, max-age=300`     | Only for this user, moderate freshness    |
+| Real-time data (stock prices) | `no-store`                 | Stale data is dangerous                   |
+| Event listings                | `public, max-age=60`       | Changes sometimes, CDN-cacheable          |
+| Auth tokens                   | `no-store`                 | Never cache sensitive credentials         |
+
+> 💡 Interview Tip  
+> Mentioning Cache-Control headers and ETags shows you think about performance at the HTTP layer, not just application logic. This is especially relevant for CDN-heavy architectures.
+
+## Content Negotiation
+
+Content negotiation is a mechanism in HTTP that allows the client and server to agree on the format of the data being exchanged. Different clients may prefer different formats such as JSON, XML, HTML, or plain text. Instead of the server always sending the same format, the client tells the server what formats it can understand, and the server chooses the best matching one.
+
+This is done using the `Accept` header. For example, a client may send:
+
+    GET /events/123
+    Accept: application/json, application/xml;q=0.9
+
+The **q** value (0-1) indicates preference. JSON is preferred (q=1.0 by default), XML is acceptable (q=0.9).
+
+The server then checks which formats it can produce and chooses the best match. If the server supports JSON, it responds like this:
+
+    HTTP/1.1 200 OK
+    Content-Type: application/json
+
+    { "id": 123, "name": "Concert" }
+
+Sometimes negotiation can fail. If the client asks for formats the server cannot provide, the server returns **406 Not Acceptable**. This means, “I understood your request, but I cannot generate any of the formats you requested.”
+
+Another related error is **415 Unsupported Media Type**. This happens when the client sends data to the server in a format the server does not understand.
+
+Most modern APIs only support JSON, making content negotiation less relevant than it once was.
+
+## JSON Patch vs JSON Merge Patch
+
+When we talked about PATCH in previous chapter's, we said it does "partial updates." But how does the client describe those partial updates? There are two standard formats.
+
+### JSON Merge Patch (RFC 7396)
+
+The simpler approach. Send a JSON object with only the fields you want to change:
+
+    PATCH /users/123
+    Content-Type: application/merge-patch+json
+    {
+      "email": "new@example.com",
+      "phone": null
+    }
+
+This sets email to the new value and deletes phone (null = remove). Fields not included are unchanged.
+
+**Limitation**: You can't set a field to null without deleting it, because null means "remove." If your data model uses null values meaningfully, merge patch won't work.
+
+### JSON Patch (RFC 6902)
+
+The more powerful approach. Send an array of operations:
+
+    PATCH /users/123
+    Content-Type: application/json-patch+json
+
+    [
+      { "op": "replace", "path": "/email", "value": "new@example.com" },
+      { "op": "remove", "path": "/phone" },
+      { "op": "add", "path": "/addresses/1", "value": { "city": "NYC" } },
+      { "op": "test", "path": "/version", "value": 5 }
+    ]
+
+Operations: `add`, `remove`, `replace`, `move`, `copy`, `test` (it checks a precondition before applying changes, similar to optimistic concurrency).
+
+| Format      | Simplicity   | Power   | Null Handling       | Use When                              |
+| ----------- | ------------ | ------- | ------------------- | ------------------------------------- |
+| Merge Patch | Very simple  | Limited | `null = delete`     | Simple field updates                  |
+| JSON Patch  | More complex | Full    | Explicit operations | Complex mutations, arrays, conditions |
+
+---
+
+---
+
+# Chapter 14 API Keys, JWTs, and OAuth 2.0
+
+## Mechanism 1: Session-Based Authentication
+
+### How It Works
+
+1. **Client sends credentials**: POST /login with email and password.
+2. **Server verifies**: Checks credentials against the database.
+3. **Server creates a session**: Stores a session object (user ID, creation time, expiration) in memory or a session store (like Redis).
+4. **Server sets a cookie**: Returns a Set-Cookie header with a session ID — a random string like sess_abc123xyz.
+5. **Client sends cookie on every request**: The browser automatically includes it in every subsequent request.
+6. **Server looks up the session**: On each request, the server takes the session ID from the cookie, looks it up in the session store, and retrieves the user's identity.
+
+```text
+Client                          Server                    Session Store
+  |                               |                           |
+  |-- POST /login (email, pass) ->|                           |
+  |                               |-- verify credentials ---->|
+  |                               |<-- user found ------------|
+  |                               |-- store session --------->|
+  |<-- Set-Cookie: sess_abc123 ---|                           |
+  |                               |                           |
+  |-- GET /events                 |                           |
+  |   Cookie: sess_abc123 ------->|                           |
+  |                               |-- lookup sess_abc123 ---->|
+  |                               |<-- user_id: 42 -----------|
+  |<-- 200 OK (events data) ------|                           |
+```
+
+| Pros                                                                | Cons                                                                                 |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Simple to implement                                                 | Server must store state (session store)                                              |
+| Server has full control — revoke a session instantly by deleting it | Doesn't scale horizontally without sticky sessions or a shared session store (Redis) |
+| Cookie handling is built into browsers — no client-side code needed | Cookies don't work well for mobile apps or third-party API access                    |
+| Battle-tested and well-understood                                   | Cross-origin requests (CORS) with cookies get tricky                                 |
+
+APIs consumed by mobile apps, third-party developers, or distributed microservices, sessions start to creak. That's where tokens come in.
+
+## Mechanism 2: API Keys
+
+An API key is a long, randomly generated string that identifies a client application.
+
+    sk_live_4xxxxxxxxxxxxxxxxxxx
+    pk_test_Txxxxxxxxxxxxxxxxxxx
+
+The `sk_` and `pk_` prefixes are a convention popularized by Stripe: `sk` = secret key (keep on your server), `pk` = publishable key (safe for the frontend).
+
+### How They Work
+
+1. **Developer signs up** for your API and generates a key.
+2. **Key is stored** in the database, associated with the developer's account.
+3. **Client sends the key** in the Authorization header.
+4. **Server looks up the key** in the database and identifies the caller.
+
+| Pros                                                   | Cons                                                                     |
+| ------------------------------------------------------ | ------------------------------------------------------------------------ |
+| Dead simple to implement                               | No user context — the key identifies an application, not a user          |
+| Easy to revoke — just delete the key from the database | No built-in expiration — keys live forever unless you add rotation logic |
+| Great for server-to-server communication               | If leaked, attacker has full access until you manually revoke it         |
+| Easy to rate-limit per key                             | Users shouldn't manage cryptographic strings — bad UX                    |
+
+API keys are bad for user-facing apps. You don't want your mobile app users copy-pasting 40-character strings. You don't want those keys sitting in a JavaScript bundle where anyone can view-source them.
+
+## Mechanism 3: JWT (JSON Web Tokens)
+
+JWT decodes to three parts::
+
+1.  **Header** — metadata about the token:
+
+        {
+          "alg": "RS256",
+          "typ": "JWT"
+        }
+
+2.  **Payload** — the actual user data (called "claims"):
+
+        {
+          "user_id": 42,
+          "email": "alice@example.com",
+          "role": "admin",
+          "exp": 1717024000
+        }
+
+3.  **Signature** — cryptographic proof that the token hasn't been tampered with.
+
+### How JWT Authentication Works
+
+1. **Client sends credentials:** POST /login with email and password.
+2. **Server verifies**: Checks credentials against the database.
+3. **Server creates a JWT**: Encodes the user's info into the payload, signs it with a secret key, and returns the token.
+4. **Client stores the token**: Typically in memory or `localStorage`.
+5. **Client sends the token on every request**: In the `Authorization: Bearer <token> header`.
+6. **Server verifies the signature**: No database lookup needed. If the signature is valid, the payload is trustworthy.
+
+```text
+Client                          Server
+  |                               |
+  |-- POST /login (email, pass) ->|
+  |                               |-- verify credentials against DB
+  |                               |-- create JWT (sign with secret key)
+  |<-- { "token": "eyJhbG..." } --|
+  |                               |
+  |-- GET /events                 |
+  |   Authorization: Bearer eyJ.. |
+  |                               |-- verify JWT signature (NO DB lookup)
+  |                               |-- extract user_id: 42, role: admin
+  |<-- 200 OK (events data) ------|
+```
+
+#### The Killer Feature: Stateless Verification
+
+With sessions, the server must look up every session in a database or Redis store on every request. That's a bottleneck.
+
+With JWTs, the server just `verifies the signature`. It's a CPU operation, not a database operation. This is a massive advantage in distributed systems — any service with the verification key can independently validate the token without calling a central auth service.
+
+### JWT Signing: Symmetric vs. Asymmetric
+
+1. **Symmetric signing (HS256)**: One shared secret key is used to both sign and verify the token. Like a shared password — anyone who can verify the token can also create fake tokens.
+
+   **Problem**: Every service that needs to verify tokens must have the secret key. If any one of them is compromised, the attacker can forge tokens.
+
+2. **Asymmetric signing (RS256)**: A private key signs the token, and a public key verifies it. The public key cannot be used to create tokens.
+
+   **Advantage**: Only the auth service has the private key. Every other service gets the public key, which is safe to distribute widely. Even if an API service is compromised, the attacker can't forge tokens.
+
+### JWT Gotchas
+
+1. **JWTs can't be revoked easily**. Unlike sessions, you can't just delete a JWT. It's valid until it expires.
+2. **Payload is NOT encrypted**. Anyone can decode a JWT and read the payload. Never put sensitive data in a JWT. The signature `prevents tampering, not reading`.
+3. Token size. JWTs are larger than session IDs because they carry data. This adds up when sent with every request.
+
+## OAuth 2.0 — The Industry Standard
+
+OAuth 2.0 is not a replacement for API keys or JWTs. It's a framework that combines them.
+
+### The Common Misconception
+
+Many developers think the choice is:
+
+- Option A: Use API keys
+- Option B: Use JWTs
+- Option C: Use OAuth 2.0  
+  But that's wrong. OAuth 2.0 is Option A + Option B working together with a defined flow.
+
+### How OAuth 2.0 Works (Client Credentials Flow)
+
+This is the flow used for **server-to-server** and **developer API access** — the most relevant flow for system design interviews.
+
+1. **Developer registers** an application and receives a Client ID (like a username) and a Client Secret (like a password). These are essentially API keys.
+2. **Application sends credentials** to the token endpoint: POST /oauth/token with the Client ID and Client Secret.
+3. **Auth server verifies** the credentials and returns a Bearer Token — which is typically a JWT.
+4. **Application uses the Bearer Token** for all API calls: Authorization: Bearer <jwt>.
+5. **Token expires (typically 1 hour)**. Application requests a new token with its credentials.
+
+```text
+Developer App                    Auth Server                 API Server
+  |                                 |                           |
+  |-- POST /oauth/token             |                           |
+  |   client_id: abc123             |                           |
+  |   client_secret: xyz789         |                           |
+  |   grant_type: client_credentials|                           |
+  |                                 |                           |
+  |<-- { "access_token": "eyJ..",   |                           |
+  |      "token_type": "Bearer",    |                           |
+  |      "expires_in": 3600 }       |                           |
+  |                                 |                           |
+  |-- GET /api/events ----------------------------------------->|
+  |   Authorization: Bearer eyJ..   |                           |
+  |                                 |                   verify JWT
+  |<-- 200 OK (events data) ----------------------------------------|
+```
+
+### Why OAuth 2.0 Exists
+
+- **API keys alone have no expiration**. If leaked, they're valid forever.
+- **OAuth tokens expire**. Even if intercepted, they're only valid for a short time (usually 1 hour).
+- **OAuth provides scoped authorization**. A token can grant read:events but not write:events. API keys are typically all-or-nothing.
+- **OAuth separates authentication from API access**. The auth server handles credentials; the API server just verifies tokens.
+
+## When to Use What in Interviews
+
+Here's the practical guide:
+
+- **Designing a web app with a single backend?** Session-based auth is fine. Mention it and move on.
+- **Designing a system with multiple microservices?** JWTs. "The auth service issues JWTs, and any downstream service can verify them independently using the public key."
+- **Designing a public API for developers?** OAuth 2.0. "Developers register for Client ID and Secret, exchange them for a short-lived Bearer Token, and use that token for API calls."
+- **The interviewer didn't specifically ask about auth?** Say "I'll use JWT-based authentication" and move on. Most interviewers don't deep-dive here — they want to see that you've thought about it.
+
+---
