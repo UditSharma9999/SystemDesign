@@ -1814,3 +1814,245 @@ Here's the practical guide:
 - **The interviewer didn't specifically ask about auth?** Say "I'll use JWT-based authentication" and move on. Most interviewers don't deep-dive here — they want to see that you've thought about it.
 
 ---
+
+# Chapter 15 Authorization, RBAC, and Multi-Tenancy
+
+## Role-Based Access Control
+
+Role-Based Access Control. Instead of giving permissions directly to each user, the system creates roles such as customer, manager, or admin, and each role has a set of allowed actions.
+
+For example, in a ticket booking platform, a customer can browse events and buy tickets. A venue manager can do everything a customer can do, plus create or edit events for their venue. An admin has full access, including managing users and approving venues. When a request comes to the API, the backend first checks if the user is authenticated, then checks if their role allows the requested action.
+
+Sometimes roles alone are not enough. The system may also need ownership checks. For instance, a customer should only be able to see their own bookings, not another customer’s bookings. An admin can view all bookings, while a venue manager can only see bookings related to their own venue. So authorization is often a mix of checking the user’s role and checking whether the resource belongs to them.
+
+## CRITICAL: User Identity Comes from the JWT, NEVER from the Request Body
+
+A very important rule in API security is that the server must never trust identity information sent in the request body. The user’s identity should always come from the JWT or authentication token because the token is verified and secure. Anything inside the request body can be changed by the client and cannot be trusted.
+
+For example, imagine a booking cancellation API where the request body contains a user_id and a booking_id. If the server trusts the user_id from the body, an attacker could simply change that number and pretend to be another user. The server might then incorrectly allow them to cancel someone else’s booking. This happens because request body data is just plain input from the client and can easily be manipulated.
+
+The **correct approach** is for the server to extract the user’s identity from the verified JWT token after authentication. Since the JWT is cryptographically signed, users cannot modify it without invalidating the signature. The server then compares the authenticated user’s ID from the token with the booking’s owner in the database. If they match, the action is allowed; otherwise, access is denied.
+
+## Multi-Tenancy: The "Immediately Disqualify" Mistake
+
+In a multi-tenant system, many different companies use the same application and database infrastructure at the same time. But each company’s data must stay completely private from others.
+
+A common mistake developers make is putting the tenant or company ID directly in the API URL, such as `/tenants/123/events`. This looks simple, but it creates a serious security risk because a user can manually change the number in the URL to another tenant’s ID and try to access someone else’s data.
+
+Imagine a user from Company A changes the request from /tenants/123/events to /tenants/456/events. If the backend accidentally trusts the URL or forgets to properly validate permissions on even one endpoint, the user could see Company B’s private information. These kinds of mistakes have caused real-world data breaches, lawsuits, and compliance violations. The problem is that developers are depending on every API endpoint to correctly check tenant access every single time, and in large systems, eventually someone forgets.
+
+**Recommended approach** is to store the tenant ID inside the JWT (JSON Web Token) when the user logs in. A JWT is cryptographically signed, which means users cannot modify its contents without invalidating the token. When a request comes in, the server reads the tenant ID directly from the verified token instead of trusting anything from the URL or request body. Then every database query is automatically filtered using that tenant ID. This ensures users can only access data belonging to their own organization, no matter what URL they try to send.
+
+This approach is considered a best practice in real production systems because it provides strong tenant isolation and reduces the chances of human error.
+
+## ABAC — Attribute-Based Access Control
+
+RBAC is great for most systems, but sometimes roles aren't granular enough. What if the authorization rule is:
+
+for example Imagine a document editing system where a user should only be allowed to edit a document if they created it, the document is still a draft, and it was created recently. A single role cannot fully represent all these conditions.
+
+ABAC solves this problem by making authorization decisions based on attributes. These attributes can belong to the user (subject), the resource, or even the environment. For example, the system may check who owns the document, what status the document is in, what time it is, or from which IP address the request is coming. Instead of asking “Does this user have the editor role?”, ABAC asks “Do all the required conditions match?”
+
+For most system design interviews, **RBAC is sufficient**. Mention ABAC if:
+
+- The system has complex authorization rules that don't map cleanly to roles.
+- You're designing something in healthcare, finance, or government where fine-grained access control is a regulatory requirement.
+- The interviewer specifically asks about granular permissions.
+
+## Field-Level Authorization
+
+Sometimes authorization isn't about entire endpoints — it's about specific fields within a response. This is especially relevant for GraphQL APIs, where clients choose which fields to query.
+
+Consider a user profile:
+
+```json
+{
+  "id": 42,
+  "name": "Alice Smith",
+  "email": "alice@example.com",
+  "salary": 95000,
+  "ssn": "123-45-6789",
+  "department": "Engineering"
+}
+```
+
+Different users should see different fields.
+
+In REST, you might handle this with different endpoints or response serializers per role. In GraphQL, you need field-level resolvers that check permissions:
+
+```graphql
+type User {
+  name: String!
+  email: String!
+  salary: Int! @auth(requires: [SELF, MANAGER, HR_ADMIN])
+  ssn: String @auth(requires: [SELF, HR_ADMIN])
+}
+```
+
+## Policy Enforcement: Where to Put Authorization Logic
+
+You have three main options for where authorization checks live:
+
+| Approach     | How It Works                                                    | Pros                           | Cons                                                             |
+| ------------ | --------------------------------------------------------------- | ------------------------------ | ---------------------------------------------------------------- |
+| Per-endpoint | Each route handler checks permissions                           | Simple, explicit               | Easy to forget on new endpoints, scattered logic                 |
+| Middleware   | Authorization middleware runs before handlers                   | Centralized, consistent        | Can be too coarse-grained for complex rules                      |
+| API Gateway  | Gateway (Kong, AWS API Gateway) enforces authorization policies | Offloads from application code | Limited to simple rules (role checks), can't do ownership checks |
+
+> In practice, most systems use a combination: the API gateway handles simple checks (is the token valid? is the user an admin?), and the application handles fine-grained checks (does the user own this resource?).
+
+---
+
+# Chapter 16 Rate Limiting, Throttling, and API Protection
+
+Rate limiting and throttling are both techniques used to protect systems from too much traffic, but they work in different ways. A simple way to understand them is through a nightclub example.
+
+Imagine a nightclub that can only safely hold 500 people. Rate limiting acts like a strict bouncer at the entrance. Once the limit is reached, no more people are allowed in. If someone tries to enter after the limit, they are rejected and told to come back later.In APIs, this usually means the server returns a 429 Too Many Requests error. The goal of rate limiting is fairness — making sure one user, bot, or application does not consume all the resources and affect everyone else.
+
+Throttling works differently. Instead of rejecting people immediately, it slows things down. If the nightclub is crowded, people wait in a queue and are allowed in gradually as space becomes available.Requests may be delayed, queued, or processed more slowly instead of being denied outright.The purpose of throttling is system stability — preventing servers from crashing during sudden traffic spikes or heavy load.
+
+Rate limiting is usually applied at a user level, such as per user account, IP address, or API key.  
+Throttling is often applied at the system or service level to handle overload situations and prevent cascading failures across distributed systems.
+
+## Rate Limiting Strategies
+
+1. **per-user rate limiting**. Here, every authenticated user gets their own request quota, usually identified through a JWT or API key. For example, a normal user might be allowed 1,000 requests per hour, while premium customers get 10,000 requests per hour. This prevents a single user from consuming excessive resources while still rewarding higher-paying customers with larger limits.
+
+2. **per-IP rate limiting**, mainly used for unauthenticated endpoints such as login, signup, or public search APIs. Since these requests do not yet have a user identity, the system tracks the client’s IP address instead. For example, an API may allow only 100 requests per hour from the same IP. This helps block brute-force attacks, spam, and scrapers. However, IP-based limits must be used carefully because many legitimate users can share the same IP address in offices, universities, or mobile networks.
+
+3. **per-endpoint rate limiting** because not all endpoints are equally expensive or risky. Read-only endpoints like `GET /events` may allow thousands of requests per hour because they are cheap and cacheable. On the other hand, sensitive endpoints such as `POST /login` may allow only a few requests per minute to prevent password attacks.
+
+4. **per-tenant rate limiting**. Here, the organization itself gets an overall quota, while users inside that organization have smaller individual quotas. For example, a tenant may get 50,000 requests per hour overall, while each user inside that tenant gets 5,000 requests per hour. This ensures that one large customer cannot overwhelm the entire system while still maintaining fairness among users within the same organization.
+
+## Rate Limiting Algorithms
+
+### 1. Token Bucket
+
+Think of a bucket that holds tokens. Each request consumes one token. Tokens refill at a fixed rate. If the bucket is empty, requests are rejected.
+
+    Bucket capacity: 10 tokens
+    Refill rate: 1 token per second
+
+    Second 0:  Bucket has 10 tokens
+              → 10 requests arrive → all served → bucket: 0
+    Second 1:  1 token refills → bucket: 1
+              → 1 request arrives → served → bucket: 0
+    Second 5:  5 tokens have refilled → bucket: 5
+              → 8 requests arrive → 5 served, 3 rejected
+
+**Pros**: Allows short bursts (up to bucket capacity), smooth refill. **Cons**: Slightly more complex to implement.
+
+### 2. Sliding Window
+
+Count requests in a rolling time window. If a user made 100 requests in the last 60 minutes, they've hit their hourly limit.
+
+Window: 60 minutes, rolling
+Limit: 100 requests
+
+    12:00 → User makes 50 requests (50/100 used)
+    12:30 → User makes 40 requests (90/100 used)
+    12:45 → User makes 15 requests... 10 served, 5 rejected (100/100)
+    13:01 → The 50 requests from 12:00 PM are now older than 60 minutes, so they “slide out” of the window. This means the user now has only 55 active requests counted in the current window.
+
+**Pros**: Precise, no boundary issues. **Cons**: Requires storing timestamps for each request (memory-intensive).
+
+### 3. Fixed Window
+
+Simpler than sliding window. Count requests in fixed time intervals (e.g., every hour from :00 to :59).
+
+    Window: 12:00-12:59, Limit: 100
+
+    12:00 → requests start counting
+    12:55 → User has made 95 requests
+    12:59 → User makes 5 more → hits 100 → rejected for rest of window
+    13:00 → Counter resets to 0 → user can make requests again
+
+**Pros**: Simple, low memory. **Cons**: Boundary problem — a user could send 100 requests at 12:59 and 100 more at 13:00, effectively getting 200 requests in 2 minutes.
+
+## The 429 Response
+
+When a client exceeds the rate limit, the API returns HTTP 429 Too Many Requests with helpful headers
+
+| Header                  | Meaning                                  | Example      |
+| ----------------------- | ---------------------------------------- | ------------ |
+| `Retry-After`           | Seconds until the client can retry       | `30`         |
+| `X-RateLimit-Limit`     | Maximum requests allowed in the window   | `100`        |
+| `X-RateLimit-Remaining` | Requests remaining in the current window | `0`          |
+| `X-RateLimit-Reset`     | Unix timestamp when the window resets    | `1717024800` |
+
+## DDoS Protection
+
+Rate limiting is your first line of defense against Distributed Denial of Service (DDoS) attacks, but it's not enough on its own. A real DDoS attack comes from thousands of IP addresses, so per-IP rate limiting won't stop it.
+
+### Defense in Depth
+
+| Layer          | Tool                       | What It Does                                                                                                            |
+| -------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Edge / CDN     | Cloudflare, AWS CloudFront | Absorbs traffic at the network edge before it reaches your servers. Geographic distribution makes it hard to overwhelm. |
+| WAF            | AWS WAF, Cloudflare WAF    | Web Application Firewall — pattern detection for malicious requests (SQL injection, XSS, known attack signatures).      |
+| API Gateway    | Kong, AWS API Gateway      | Rate limiting, authentication, request validation. First application-layer defense.                                     |
+| Application    | Your code                  | Per-user rate limiting, business logic validation, input sanitization.                                                  |
+| Infrastructure | AWS Shield, auto-scaling   | Network-level DDoS mitigation, automatic scaling to absorb traffic spikes.                                              |
+
+The principle is defense in depth — multiple layers, each catching what the previous layer missed. No single layer is sufficient.
+
+## Replay Attack Prevention
+
+A replay attack is when an attacker intercepts a valid request and sends it again. Imagine someone eavesdrops on your "transfer $100 to Alice" API call and replays it 50 times. You just lost $5,000.
+
+### How Replay Attacks Work
+
+    1. User sends: POST /transfer { "to": "alice", "amount": 100 }
+      Authorization: Bearer eyJ...
+
+    2. Attacker intercepts this request (via network sniffing, proxy, etc.)
+
+    3. Attacker replays the exact same request 50 times
+      → Server sees a valid JWT, valid request → processes all 50
+
+### Prevention Strategies
+
+**1. Short-lived JWT** token means the login token expires quickly, for example in 15 minutes. So even if someone steals it, they only have a very small time window to misuse it before it becomes invalid.
+
+**2. Nonce** is a unique random value added to every request. The server remembers which nonces it has already seen. If the same request is sent again with the same nonce, the server knows it is a duplicate and rejects it. This prevents the same request from being replayed multiple times, even if someone captures it.
+
+**3. idempotency key**. The server processes the request the first time and stores the result along with that key. If the same request is accidentally sent again (because of retries, network issues, or double-clicking), the server does not run the payment again. Instead, it recognizes the same key and simply returns the original response.
+
+## CORS — Cross-Origin Resource Sharing
+
+CORS is a browser security mechanism that prevents a website at `evil.com` from making API calls to `yourbank.com` using your cookies. It's not an API design choice — it's a browser restriction you need to configure correctly.
+
+### How CORS Works
+
+When a browser makes a cross-origin request (e.g., JavaScript on frontend.com calls api.backend.com), the browser first sends a preflight request (an `OPTIONS` request) asking the server "is this allowed?"
+
+If the server's response allows the origin, method, and headers, the browser proceeds with the actual request. If not, the browser blocks it — the JavaScript code gets a CORS error.
+
+### Key CORS Headers
+
+| Header                           | What It Controls                         | Example                                                                        |
+| -------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------ |
+| Access-Control-Allow-Origin      | Which origins can make requests          | https://frontend.com (specific) or \* (any — dangerous for authenticated APIs) |
+| Access-Control-Allow-Methods     | Which HTTP methods are allowed           | GET, POST, PUT, DELETE                                                         |
+| Access-Control-Allow-Headers     | Which custom headers are allowed         | Authorization, Content-Type                                                    |
+| Access-Control-Allow-Credentials | Whether cookies/auth headers are sent    | true (required for authenticated requests)                                     |
+| Access-Control-Max-Age           | How long to cache the preflight response | 86400 (24 hours)                                                               |
+
+### Common Mistakes
+
+- **Using** `Access-Control-Allow-Origin: *` **with credentials**. The browser rejects this combination. If you send cookies or Authorization headers, you must specify exact origins.
+- **Forgetting the preflight**. `OPTIONS` requests must return CORS headers. If your server doesn't handle OPTIONS, the browser blocks the actual request.
+- **Overly permissive** origins. Allowing `*` on an authenticated API means any website can make requests with your users' credentials.
+
+### Cross-Site Scripting (XSS)
+
+It is when an attacker injects malicious JavaScript through user input that gets rendered in other users' browsers.
+
+**Prevention:**
+
+- **Sanitize on input**: Strip or encode HTML tags from user input.
+- **Escape on output**: When rendering user-generated content, HTML-encode special characters (`<` → `&lt;`, `>` → `&gt;`).
+- **Content-Security-Policy header**: Tell the browser to only execute scripts from trusted sources.
+- **HttpOnly cookies**: Prevent JavaScript from accessing session cookies.
+
+---
