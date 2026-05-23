@@ -2056,3 +2056,21 @@ It is when an attacker injects malicious JavaScript through user input that gets
 - **HttpOnly cookies**: Prevent JavaScript from accessing session cookies.
 
 ---
+
+
+# Common Mistakes and Anti-Patterns
+1. **Verbs in URLs** – URLs should represent resources (nouns), while HTTP methods define actions. Use GET /users instead of /getUsers.
+2. **User ID in Request Body** – Never trust user IDs sent by clients because they can be modified. Extract user identity from authentication tokens (JWT).
+3. **Tenant ID in URL Path** – Putting tenant/company IDs in URLs can accidentally expose another tenant’s data. Store tenant info securely inside the token.
+4. **Inconsistent Naming** – Mixing styles like camelCase, snake_case, uppercase, or singular/plural makes APIs confusing. Follow one consistent naming convention.
+5. **No Pagination** – Returning huge datasets in one request can crash servers and clients. Always limit results using pagination (limit, cursor).
+6. **Nested Pagination** – Paginating data inside already paginated data becomes hard to manage. Keep nested resources as separate endpoints.
+7. **Booleans Instead of Enums** – Boolean fields are hard to extend later. Enums support multiple future states cleanly.
+8. **Exposing Auto-Increment IDs** – Sequential IDs are predictable and reveal business information. Use UUIDs to improve security.
+9. **No Versioning Strategy** – Changing APIs without versioning breaks old clients. Use versions like /v1 and /v2.
+10. **Chatty APIs** – Too many API calls increase latency and slow applications. Combine related data into fewer requests.
+11. **Ignoring Idempotency** – Retried requests can create duplicates like double payments. Use idempotency keys to prevent repeated actions.
+12. **Leaky Error Messages** – Detailed internal errors expose system information to attackers. Show generic errors publicly and log details internally.
+13. **Mirroring Database Tables** – APIs should model business logic, not directly expose database structure. This avoids tight coupling and future issues.
+14. **No Async for Long Operations** – Long-running requests may timeout and retry unnecessarily. Use async processing with status polling.
+15. **Ignoring ETags/Caching** – Without caching, clients repeatedly download unchanged data. Use cache headers and ETags to improve performance.
