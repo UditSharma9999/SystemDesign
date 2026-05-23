@@ -172,3 +172,243 @@ When you insert a new key, the B-tree finds the correct leaf page and adds the k
 ![text14](/assets/14.png)
 
 Updates modify the leaf page in place. Deletes mark the key as removed (and the space gets reclaimed later). All of this involves random I/O — jumping to specific pages on disk. That's fine for reads, but it becomes a `bottleneck for write-heavy workloads`.
+
+## LSM Trees — Optimized for Writes
+
+What if your workload is 90% writes? Think of a time-series database ingesting millions of sensor readings per second, or a messaging system like Discord storing billions of messages. Random in-place updates on a B-tree become a bottleneck.
+
+The **Log-Structured Merge Tree (LSM tree)** takes a fundamentally different approach: instead of updating data in place, it **buffers writes in memory** and flushes them to disk as sorted, immutable files.
+
+#### How LSM Trees Work
+
+        1. WRITE arrives
+                ↓
+        2. Insert into MEMTABLE  (in-memory sorted structure, typically a red-black tree)
+                ↓ (when memtable is full, ~64MB)
+        3. Flush to disk as an SSTABLE  (Sorted String Table — one sequential write)
+                ↓ (over time, SSTables accumulate)
+        4. COMPACTION merges multiple SSTables into larger, sorted ones
+
+> **Writes never touch disk until the flush. That's why LSM trees handle millions of writes per second.**
+
+![Text15](/assets/15.png)
+
+**Memtable**: An in-memory sorted data structure (red-black tree or skip list). All writes go here first. This is blazing fast — no disk I/O at all.
+
+- **SSTable (Sorted String Table)**: When the memtable fills up, it gets written to disk as a single sorted file. This is a sequential write — the fastest thing you can do on disk. No random seeks.
+
+- **Compaction**: Over time, you accumulate many SSTables. Background threads merge them together, removing deleted keys and combining updates. This keeps read performance from degrading.
+
+![Text16](/assets/16.png)
+
+### The Read Path (Where LSM Trees Pay)
+
+Reading from an LSM tree is more complex:
+
+1. Check the memtable (in memory — fast)
+2. Check the most recent SSTable on disk
+3. Check the next SSTable
+4. ... keep checking older SSTables until found
+
+This is called **read amplification** — a single read might check multiple files. To mitigate this, LSM trees use Bloom filters at each level: a probabilistic data structure that can tell you "this key is definitely NOT in this SSTable" without reading the file. This skips most unnecessary checks.
+
+![Text17](/assets/17.png)
+
+<br/>
+
+![Text18](/assets/18.png)
+
+### The Big Trade-Off: B-Trees vs LSM Trees
+
+| Amplification Type  | What It Means                          | B-Tree                                 | LSM Tree                                                       |
+| ------------------- | -------------------------------------- | -------------------------------------- | -------------------------------------------------------------- |
+| Read amplification  | How many disk reads per query          | Low (3–4 reads)                        | Higher (check multiple SSTables)                               |
+| Write amplification | How many times data is written to disk | Higher (in-place updates, page splits) | Lower (sequential writes, but compaction re-writes)            |
+| Space amplification | How much extra disk space is used      | Low (one copy of data)                 | Higher (multiple SSTables may have same key during compaction) |
+
+<br/>
+
+| Feature          | B-Tree                       | LSM Tree                                       |
+| ---------------- | ---------------------------- | ---------------------------------------------- |
+| Read latency     | Predictable, fast            | Variable (may check multiple levels)           |
+| Write throughput | Good                         | Excellent (sequential writes)                  |
+| Space usage      | Efficient                    | Can temporarily use 2× space during compaction |
+| Range queries    | Excellent                    | Good (within each SSTable)                     |
+| Concurrency      | Page-level locking           | Append-only, minimal lock contention           |
+| Used by          | PostgreSQL, MySQL, Oracle    | Cassandra, RocksDB, LevelDB, DynamoDB          |
+| Best for         | OLTP with mixed reads/writes | Write-heavy, time-series, logging              |
+
+## Hash Indexes — O(1) But Limited
+
+A hash index is the simplest index type. It hashes the key and maps it directly to a location.
+
+`hash("alice@example.com") → bucket 4,271 → heap page 847, slot 3`
+
+![Text19](/assets/19.png)
+
+- **O(1) equality lookups** — the fastest possible for exact-match queries
+- Simple implementation
+
+**Weaknesses:**
+
+- **No range queries** — WHERE age > 25 can't use a hash index because hashing destroys ordering
+- **No sorting** — ORDER BY can't leverage a hash index
+- **No partial matching** — WHERE name LIKE 'Al%' needs ordered data
+
+---
+
+# Chapter 3 Normalization — Store Each Fact Once
+
+| Anomaly Type   | What Happens                                                                 | Example                                             |
+| -------------- | ---------------------------------------------------------------------------- | --------------------------------------------------- |
+| Update Anomaly | Changing one piece of information requires updating it in multiple rows.     | Updating Alice's email in every order record.       |
+| Insert Anomaly | You cannot add data unless some unrelated data also exists.                  | Cannot add a new user until they place an order.    |
+| Delete Anomaly | Removing one piece of data accidentally removes other important information. | Deleting Bob's only order also deletes Bob's email. |
+
+## The Normal Forms
+
+### First Normal Form (1NF) — No Repeating Groups
+
+Every column must contain a single, atomic value. No arrays, no comma-separated lists, no nested structures.
+
+### Second Normal Form (2NF) — No Partial Dependencies
+
+Satisfies 1NF plus: every non-key column depends on the entire primary key, not just part of it. This only matters when you have a composite primary key.
+
+### Third Normal Form (3NF) — No Transitive Dependencies
+
+Satisfies 2NF plus: no non-key column depends on another non-key column.
+
+### BCNF — The Strict Version
+
+Boyce-Codd Normal Form is a stricter version of 3NF. It says: every determinant (column that determines another column's value) must be a candidate key.
+
+In practice, 3NF covers 99% of cases. BCNF only matters in edge cases with overlapping candidate keys. You'll never need it in a system design interview, but knowing it exists shows depth if an interviewer asks.
+
+## How to Apply This in Practice
+
+You don't sit in an interview reciting normal forms. Instead, use this mental checklist:
+
+- **Is any data repeated across rows?** If yes, it probably belongs in its own table with a foreign key reference.
+- **If I update this value, do I need to update it in multiple places?** If yes, normalize it.
+- **Can I add a new entity without creating dummy data in unrelated columns?** If no, you have an insert anomaly.
+
+## When to Stop Normalizing
+
+Normalization isn't a goal in itself — it's a tool for data integrity. Over-normalizing creates its own problems:
+
+- **Too many joins**: If every query requires joining 7 tables, your reads slow down
+- **Complexity**: More tables means more foreign keys, more migration files, more cognitive load
+- **Diminishing returns**: The jump from unnormalized to 3NF is huge. The jump from 3NF to BCNF is almost never worth it in application databases.
+
+---
+
+# Chapter 4 Denormalization — Trading Writes for Reads
+
+**Normalization optimizes for writes and consistency. Denormalization optimizes for reads and speed.**
+
+## What Denormalization Actually Means
+
+Denormalization means deliberately storing redundant data to avoid expensive operations at read time.
+
+### Example 1: Embedding the Author's Name
+
+**Normalized**: To display a post with its author's name, you join two tables:
+
+```SQL
+SELECT posts.content, users.username
+FROM posts
+JOIN users ON posts.user_id = users.id
+WHERE posts.id = 42;
+```
+
+**Denormalized**: Store the author's name directly on the post:
+
+```sql
+-- No join needed
+SELECT content, author_username
+FROM posts
+WHERE id = 42;
+```
+
+The `author_username` column is redundant — it duplicates data from the `users` table. But it eliminates a join on every post read. For a feed showing 50 posts, that's 50 joins you just avoided.
+
+### Example 2: Pre-computed Counts
+
+Normalized: Count likes by querying the likes table:
+
+```sql
+SELECT COUNT(*) FROM likes WHERE post_id = 42;
+```
+
+**Denormalized**: Store the count directly on the post:
+
+```sql
+SELECT like_count FROM posts WHERE id = 42;
+```
+
+Every time someone likes or unlikes a post, you increment or decrement `like_count`. The count is always available without scanning the likes table.
+
+### Example 3: Materialized Feeds
+
+**Normalized**: Compute the home feed at read time by joining posts, follows, and sorting:
+
+```sql
+SELECT posts.* FROM posts
+JOIN follows ON posts.user_id = follows.following_id
+WHERE follows.follower_id = ?
+ORDER BY posts.created_at DESC
+LIMIT 50;
+```
+
+**Denormalized**: Pre-compute the feed into a `feed_items` table:
+feed_items
+
+```txt
+┌─────────┬─────────┬────────────┬─────────┐
+│ user_id │ post_id │ created_at │ author  │
+├─────────┼─────────┼────────────┼─────────┤
+│    1    │   500   │ 2024-03-15 │ bob     │
+│    1    │   499   │ 2024-03-15 │ carol   │
+│    1    │   497   │ 2024-03-14 │ bob     │
+└─────────┴─────────┴────────────┴─────────┘
+```
+
+Reading the feed is now a simple range scan on one table. The complexity shifts to write time
+
+## The Cost of Denormalization
+
+1. **Consistency Becomes Your Responsibility**
+2. **Writes Get More Complex**
+
+## When to Denormalize
+
+| Signal                                          | Example                                                  |
+| ----------------------------------------------- | -------------------------------------------------------- |
+| A hot read path requires joins that add latency | Home feed joining posts + follows + users                |
+| An aggregation runs on every page load          | `COUNT(*)` for likes, comments, followers                |
+| The same join appears in many queries           | Author name shown on posts, comments, notifications      |
+| Read/write ratio is heavily skewed toward reads | Social media (1000:1 reads to writes on popular content) |
+
+### Don't denormalize when:
+
+| Signal                      | Example                                                                   |
+| --------------------------- | ------------------------------------------------------------------------- |
+| The data changes frequently | User email (changes create mass updates across tables)                    |
+| Consistency is critical     | Financial transactions, inventory counts                                  |
+| The read pattern is simple  | Direct lookups by primary key (already fast with an index)                |
+| A cache would solve it      | If the data fits in Redis, cache the join result instead of denormalizing |
+
+## Cache vs Denormalize — A Key Decision
+
+Before denormalizing, ask: would a cache solve this problem?
+
+![Text20](/assets/20.png)
+
+## A Practical Framework
+
+Here's how to think about denormalization in a system design interview:
+
+![Text21](/assets/21.png)
+
+---
