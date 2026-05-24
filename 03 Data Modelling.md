@@ -412,3 +412,544 @@ Here's how to think about denormalization in a system design interview:
 ![Text21](/assets/21.png)
 
 ---
+
+# Chapter 5 The Relational Model — The Default That Scales
+
+![text22](/assets/22.png)
+
+#### Why SQL Is the Default
+
+The relational model gives you something no other model does out of the box: ACID
+
+## How Modern SQL Actually Scales
+
+### Read Replicas
+
+**read replicas**. Most apps do far more reading than writing, so one main database handles all writes, while multiple copies of that database handle read requests. For example, when you open a dashboard or analytics page, those reads can go to replicas instead of overloading the main database
+
+The only downside is a tiny delay called **replication lag**. A write to the primary might take 10-100ms to propagate to replicas. For most features this is invisible. For critical reads (like checking a balance right after a transfer), you read from the primary.
+
+### Connection Pooling (PgBouncer)
+
+onnection pooling using tools like PgBouncer. Databases struggle when thousands of applications connect directly at the same time. PgBouncer acts like a traffic manager: applications connect to PgBouncer, and it reuses a smaller number of real database connections efficiently. This reduces CPU overhead and allows many more users to access the database smoothly.
+
+### Table Partitioning
+
+As databases grow to billions of rows, searching through one huge table becomes slow. That’s where **table partitioning** helps. Instead of storing everything in one giant table, data is split into smaller sections, often by date. For example, orders from January go into one partition and February orders into another. If you search only January data, the database scans just that section instead of the entire table, making queries much faster.
+
+### Vitess — Horizontal Sharding for MySQL
+
+For even larger systems, companies use horizontal sharding, where data is split across multiple database servers. Vitess helps automate this for MySQL. Instead of developers manually deciding which server stores which user’s data, Vitess automatically routes queries to the correct shard. It also supports online schema changes and distributed queries, making large-scale MySQL systems easier to manage.
+
+### NewSQL — Distributed SQL That Just Works
+
+NewSQL databases like CockroachDB and Google Cloud Spanner. These databases combine traditional SQL features with automatic horizontal scaling. They spread data across many servers while still supporting ACID transactions and standard SQL. To keep data consistent across machines, they use distributed consensus systems, which adds a little extra latency but allows them to scale almost endlessly while remaining reliable.
+
+## When Relational Is NOT the Right Choice
+
+| Scenario                                              | Why SQL Struggles                          | Better Option                      |
+| ----------------------------------------------------- | ------------------------------------------ | ---------------------------------- |
+| Very high write throughput (100K+ writes/sec)         | Single-primary bottleneck                  | Wide-column (Cassandra, ScyllaDB)  |
+| Rapidly evolving schema                               | `ALTER TABLE` on large tables is expensive | Document store (MongoDB, DynamoDB) |
+| Simple key-value lookups with sub-millisecond latency | SQL parsing overhead is unnecessary        | Key-value (Redis, DynamoDB)        |
+| Full-text search with ranking                         | SQL `LIKE` is slow, no relevance scoring   | Search engine (Elasticsearch)      |
+| Deeply nested, hierarchical data                      | Joins get expensive at many levels         | Document store or graph database   |
+
+## Blob and Object Storage — Where Large Files Go
+
+Images, videos, PDFs, and other large blobs belong in object storage (Amazon S3, Google Cloud Storage, Azure Blob Storage), not in PostgreSQL. Your relational database stores the metadata — filename, owner, upload timestamp, content type — with a URL pointing to the object in S3.
+
+---
+
+# Chapter 6 Document and Key-Value Models — Access-Pattern-First Design
+
+In document databases, all related data is usually stored together in one big document instead of being split across many tables. So this makes reads very fast and simple.
+
+But the downside is data duplication, also called denormalization. If Alice’s email is stored inside every order document, and she changes her email address, you now have to update that email in hundreds of separate documents.
+
+## The Core Principle: Access Pattern First
+
+In the relational world, you model your data first and figure out queries later. In the document world, you flip it: **start with how you'll query the data, then model it to serve those queries.**
+
+This is the fundamental mindset shift. A relational schema asks "what are the entities and relationships?" A document schema asks "what will the application screen look like?"
+
+| Design Approach | Starting Question            | Optimized For                      |
+| --------------- | ---------------------------- | ---------------------------------- |
+| Relational      | What are my entities?        | Flexibility, ad-hoc queries        |
+| Document        | What are my access patterns? | Read performance, specific queries |
+
+If your application has a product detail page that shows the product, its reviews summary, and the seller info — a document database lets you store all of that in one document and serve it in one read.
+
+## Embedding vs. Referencing
+
+With **embedding**, related data is stored directly inside the main document. For example, an order document may contain all its line items inside it. This is useful when the data is usually read together, the relationship is small, and the embedded data rarely changes on its own. Embedding also allows atomic updates, meaning the whole document can be updated safely in a single operation. The advantage is speed and simplicity because one database read returns everything you need.
+
+With **referencing**, instead of storing the full related data inside the document, you store only a reference or ID pointing to another document. This is similar to foreign keys in SQL databases. Referencing is better when related data is large, changes frequently, or needs to be accessed separately. For example, a user may have thousands of orders, so storing all orders inside one user document would make it huge and inefficient. In that case, each order is stored separately and linked using references.
+
+## DynamoDB — Single-Table Design and Its Evolution
+
+Amazon DynamoDB is a database designed for massive scale and very fast lookups. Every piece of data is stored using a partition key (which decides where the data lives) and optionally a sort key (which helps organize related data together). Instead of traditional SQL tables with joins, DynamoDB is optimized around known access patterns — you design the database based on how the application will query data.
+
+For a long time, developers promoted something called **single-table design**. Instead of creating separate tables for users, orders, and products, everything was stored in one big table. Different entity types were identified using patterns like `USER#alice` or `ORDER#1234`. This allowed related data to be fetched very efficiently in a single query and reduced the need for joins. Developers also used overloaded indexes (GSIs) to support many query patterns from the same table.
+
+But it came with drawbacks. The schema became hard to understand because generic column names like PK and SK didn’t clearly describe the data. Adding new query patterns could require creating new indexes, and changing the table structure later could mean rewriting millions of records. Many teams found these designs difficult to maintain.
+
+## Key-Value Stores — Redis and the Speed Layer
+
+A key-value store is the simplest possible data model: you have a key, you have a value, you do GET and SET. That's it.
+
+Redis is the most widely used key-value store, and it's everywhere.  
+Redis is not a primary database — it's an acceleration layer. Your source of truth lives in PostgreSQL or DynamoDB. Redis sits in front for hot data that needs sub-millisecond latency.
+
+**The pattern**: check Redis first. On a cache hit, return immediately. On a cache miss, query the primary database, populate the cache with a TTL, then return.
+
+## When Document Makes Sense (And When It Doesn't)
+
+| Document Wins                                                    | Document Loses                           |
+| ---------------------------------------------------------------- | ---------------------------------------- |
+| Data is naturally hierarchical (product catalogs, user profiles) | Complex joins across entities            |
+| Access patterns are well-defined and key-based                   | Ad-hoc reporting and analytics           |
+| Schema varies between items (CMS content, event data)            | Referential integrity is critical        |
+| Read-heavy with predictable query patterns                       | Many-to-many relationships               |
+| Rapid iteration on schema (startups, prototyping)                | Transactions spanning multiple documents |
+
+---
+
+# Chapter 7 Wide-Column and Time-Series Models — When Writes Dominate
+
+## Think of It Like a Filing Cabinet With a Twist
+
+Imagine a filing cabinet where each drawer is labeled with a customer name (the partition key), and inside each drawer, documents are sorted by date (the clustering key). You can quickly pull all documents for one customer in date order — but asking "show me all documents from March across all customers" means opening every single drawer.
+
+That's the **wide-column model**. It's blazing fast for the queries it's designed for, and painful for everything else. You design the schema around your queries, not your entities.
+
+## Cassandra — The Wide-Column Workhorse
+
+Its data model revolves around two concepts:
+
+- **Partition key**: Determines which node stores the data. All rows with the same partition key live on the same node.
+
+- **Clustering key**: Determines the sort order within a partition. Rows with the same partition key are sorted by clustering key on disk.
+
+```sql
+CREATE TABLE messages (
+    channel_id UUID,
+    message_id TIMEUUID,
+    author_id UUID,
+    content TEXT,
+    created_at TIMESTAMP,
+    PRIMARY KEY (channel_id, message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
+```
+
+Here, `channel_id` is the partition key and `message_id` (a time-based UUID) is the clustering key. This means:
+
+- All messages for one channel are stored together on the same node
+- Within a channel, messages are sorted by time (newest first)
+
+### Query-First Design
+
+In relational databases, you model entities first and figure out queries later. In Cassandra, you do the opposite: **start with your queries, then design tables to serve them.**
+
+Need messages by channel? One table. Need messages by user? A second table with the same data, partitioned differently:
+
+```SQL
+-- Optimized for "messages in a channel"
+CREATE TABLE messages_by_channel (
+    channel_id UUID,
+    message_id TIMEUUID,
+    content TEXT,
+    PRIMARY KEY (channel_id, message_id)
+);
+
+-- Optimized for "messages by a user"
+CREATE TABLE messages_by_user (
+    user_id UUID,
+    message_id TIMEUUID,
+    content TEXT,
+    PRIMARY KEY (user_id, message_id)
+);
+```
+
+Yes, you store the data twice. That's the trade-off: **storage duplication for query performance**. There are no joins in Cassandra, so every query pattern needs its own table.
+
+### Time-Series Bucketing
+
+For time-series data, unbounded partitions are dangerous. If a sensor sends data every second for a year, that's 31 million rows in one partition — too large.
+
+The solution is **bucketing**: add a time component to the partition key.
+
+```sql
+CREATE TABLE sensor_readings (
+    sensor_id UUID,
+    day DATE,
+    reading_time TIMESTAMP,
+    value DOUBLE,
+    PRIMARY KEY ((sensor_id, day), reading_time)
+);
+```
+
+Now each partition holds one day's data for one sensor. Predictable size, easy to query ("readings for sensor X on March 15"), and old data can be dropped by TTL or partition deletion.
+
+**Google Bigtable** inspired the entire wide-column category. It powers Google's internal systems — search indexing, Maps, Gmail, Analytics. Not available as a standalone product, but Cloud Bigtable is the managed version.
+
+**HBase** is the open-source Bigtable clone, running on top of HDFS (Hadoop's file system). It's common in analytics and batch-processing pipelines where you need to scan large ranges of data.
+
+## TimescaleDB — Time-Series on PostgreSQL
+
+TimescaleDB is a PostgreSQL extension that adds time-series superpowers:
+
+- **Hypertables**: Automatic time-based partitioning. You create a regular table, call create_hypertable(), and TimescaleDB handles partition management.
+- **Compression**: 10-20x compression on older data. Recent data stays uncompressed for fast writes.
+- **Continuous aggregates**: Materialized views that automatically update as new data arrives. Pre-compute hourly/daily rollups without batch jobs.
+- **Retention policies**: Automatically drop data older than N days.
+
+The beauty: you get time-series performance with full SQL, joins, transactions, and your existing PostgreSQL tooling.
+
+> 💡 Interview Tip  
+> Only bring up Cassandra or a wide-column store when the problem explicitly involves massive write throughput or time-series data (messaging, metrics, activity feeds). If you mention Cassandra for a simple CRUD app, it signals you're choosing buzzwords over pragmatism.
+
+---
+
+# Chapter 8 Specialized Models — Graph, Search, and Polyglot Persistence
+
+## Graph Databases — When Relationships Are the Data
+
+### How They Work
+
+Graph databases store data as nodes (entities) and edges (relationships between them).
+
+![Text23](/assets/23.png)
+
+### When Graphs Actually Help
+
+| Use Case               | Why Graph Wins                                                      |
+| ---------------------- | ------------------------------------------------------------------- |
+| Fraud detection        | Detect rings of accounts transferring money in circles              |
+| Recommendation engines | "Users who liked X also liked Y" — traverse preference edges        |
+| Knowledge graphs       | Wikipedia-style "related concepts" with arbitrary depth             |
+| Network topology       | "Which switches are between server A and server B?"                 |
+| Access control         | "Does user X have permission Y through any group membership chain?" |
+
+### When Graphs Don't Help (And This Is Important)
+
+most social media queries don't need deep graph traversals. "Show me Alice's friends" is a simple one-hop query that a relational database with a follows table handles perfectly. "Show me friends-of-friends-of-friends" (3+ hops) is where graph databases shine — and most products never need that.
+
+> 💡 Interview Tip  
+> Don't mention graph databases in a system design interview unless the problem explicitly involves multi-hop relationship traversal (fraud detection, recommendation engines, access control). For social media apps, a relational follows table with proper indexes is the correct answer.
+
+## Search Engines — When You Need Full-Text and Fuzzy Matching
+
+### The Problem Relational Databases Can't Solve Well
+
+```sql
+-- This is slow and limited
+SELECT * FROM products WHERE name LIKE '%wireless headphone%';
+```
+
+`LIKE '%term%'` can't use a B-tree index. It scans every row. And it can't handle typos ("wireles headphone"), synonyms ("earbuds"), or relevance ranking.
+
+### How Elasticsearch Works
+
+Elasticsearch builds an **inverted index** — the same structure used by search engines like Google.
+
+Before indexing data, Elasticsearch **breaks text into tokens** using something called an analyzer. For example, “Wireless Headphones Pro” might be split into tokens like “wireless,” “headphones,” and “pro.” These tokens are what get stored in the inverted index. This is why it can match individual words inside long text fields.
+
+Normal index: document → words in that document Inverted index: word → documents containing that word
+
+        Inverted Index:
+        "wireless"   → [doc_1, doc_5, doc_12]
+        "headphone"  → [doc_1, doc_3, doc_5]
+        "bluetooth"  → [doc_1, doc_5, doc_8]
+
+Searching for "wireless headphone" → intersect the two posting lists → `[doc_1, doc_5]`. Fast, regardless of how many documents exist.
+
+Elasticsearch also handles:
+
+- **Fuzzy matching**: "wireles" still finds "wireless"
+- **Tokenization**: Breaking text into searchable terms
+- **Relevance scoring**: Results ranked by TF-IDF or BM25
+- **Autocomplete**: Prefix matching with edge-ngrams
+
+### The Pattern: Search Alongside Primary Database
+
+Elasticsearch is not a primary database — it doesn't provide ACID transactions or referential integrity. The standard pattern:
+
+![Text24](/assets/24.png)
+
+Elasticsearch is usually not used as the main database. Instead, applications keep a primary database like PostgreSQL as the “source of truth,” and then copy data into Elasticsearch for search. This sync happens asynchronously, so search results might lag slightly behind real data, but that trade-off is acceptable for most applications.
+
+### When to Add Search
+
+| Signal                                    | Example                                 |
+| ----------------------------------------- | --------------------------------------- |
+| Full-text search across large text fields | Product descriptions, articles, reviews |
+| Autocomplete / type-ahead                 | Search bars, address lookup             |
+| Fuzzy matching needed                     | Handling typos in user queries          |
+| Complex filtering + sorting + relevance   | E-commerce product search with facets   |
+| Log analysis                              | Centralized logging (ELK stack)         |
+
+## NewSQL — Distributed SQL That Actually Scales
+
+Traditional SQL: strong consistency + transactions, but scaling means manual sharding. NoSQL: horizontal scaling, but you give up joins, transactions, and SQL. NewSQL: **horizontal scaling with full SQL, ACID transactions, and automatic sharding**.
+
+**Need SQL + horizontal scaling + ACID**
+
+### Google Spanner ..........
+
+---
+
+**Geospatial Indexes** : If your system design involves "find nearby restaurants" or "drivers within 5km," you need geospatial indexing. Relational databases handle this with extensions.
+
+Most real-world systems use more than one database. This is called **polyglot persistence** — choosing the right database for each specific workload.
+
+## (IMP) The Decision Framework
+
+        1. Start with PostgreSQL (or MySQL) as your primary database
+        2. For each access pattern that struggles, ask:
+                a. Can I solve it with an index or query optimization? → Do that
+                b. Can I solve it with a cache (Redis)? → Add a cache
+                c. Do I need full-text search? → Add Elasticsearch
+                d. Do I need massive write throughput for time-series? → Add Cassandra or TimescaleDB
+                e. Do I need multi-hop graph traversals? → Add Neo4j
+                f. Do I need horizontal SQL scaling? → Consider CockroachDB/Spanner
+        3. Every additional database adds operational complexity — justify it
+
+---
+
+# Chapter 9 Replication Models — Leader, Multi-Leader, and Leaderless
+
+## Leader-Follower Replication (The Default)
+
+The most common replication model, used by PostgreSQL, MySQL, MongoDB, and Redis.
+
+![Text25](/assets/25.png)
+
+### How it works:
+
+1. One node is the leader (also called primary or master). All writes go through it.
+2. The leader sends every write to all followers (replicas) via a replication log.
+3. Clients can read from any follower (for read scaling) or from the leader (for consistency).
+
+### Synchronous vs asynchronous replication:
+
+- In **synchronous replication**, the leader waits until at least one (or all) follower replicas confirm they received the write before telling the client “success.” This guarantees all replicas are fully up to date at that moment, so reads from any replica are consistent. The downside is speed: if even one replica is slow or temporarily lagging, every write gets delayed.
+
+- In **asynchronous replication**, the leader immediately confirms the write to the client and then sends the update to followers in the background. This makes writes very fast, but it introduces replication lag — followers might still show old data for a short time. So a user might write data and then immediately not see it on a replica.
+
+- In **semi-synchronous replication**, the system combines both approaches. The leader waits for at least one follower to confirm the write, but not all of them. Other replicas can catch up later asynchronously. This gives a balance: better safety than pure async, but better performance than full sync. Most real-world databases use some variation of this because it provides a practical trade-off between consistency and latency.
+
+In practice, fully synchronous replication is too slow. Most systems use semi-synchronous (one sync follower for durability guarantee, rest async for speed).
+
+#### Replication Lag
+
+With async replication, followers lag behind the leader. A write that just committed on the leader might not be visible on a follower for milliseconds to seconds.
+
+This creates three problems:
+
+- **Read-after-write inconsistency**: Alice updates her profile on the leader, then reads from a follower that hasn't caught up yet — she sees her old profile.  
+  **Fix**: Route a user's reads to the leader for a few seconds after they write. Or track the user's latest write timestamp and only read from followers that are caught up past that point.
+
+- **Monotonic read violations**: Bob reads his feed from Follower A (sees 10 posts), then reads from Follower B (which is further behind — sees only 8 posts). Posts disappeared!  
+  **Fix**: Pin each user's reads to the same follower (using a hash of user ID).
+
+- **Causal ordering violations**: Carol posts "Is anyone hiring?", Dave replies "Yes, we are!" — but a follower shows Dave's reply before Carol's post because the writes arrived out of order.  
+  **Fix**: Use causal consistency mechanisms or ensure causally related writes go through the same replication path.
+
+#### Failover
+
+When the leader dies, a follower must be promoted. This is called failover.
+
+1. Detect that the leader has failed (usually via timeout)
+2. Elect a new leader (typically the most up-to-date follower)
+3. Reconfigure clients to send writes to the new leader
+
+**Dangers**
+
+1. The new leader may not have all the old leader's latest writes (data loss)
+2. If the old leader comes back, it thinks it's still the leader (split brain — two nodes accepting writes simultaneously)
+3. Misconfigured timeouts can trigger unnecessary failovers under load
+
+## Multi-Leader Replication
+
+Each datacenter has its own leader. Used when you need writes in multiple geographic regions.
+
+![Text26](/assets/26.png)
+
+When it makes sense:
+
+- Multi-region deployments where users need low-latency writes from their local region
+- Offline-first apps (each device acts as a leader, syncs when reconnected)
+- Collaborative editing
+
+**The problem**: write conflicts. If User A in the US edits a document and User B in the EU edits the same document simultaneously, both leaders accept the write. Now the two leaders have conflicting versions.
+
+**Conflict resolution strategies:**
+
+- **Last write wins (LWW)**: Use timestamps, higher timestamp wins. Simple but loses data.
+- **Merge values**: Keep both versions and let the application merge them (like Git merge)
+- **Custom resolution**: Application-specific logic
+
+## Leaderless Replication (Dynamo-Style)
+
+No designated leader. Any node can accept reads and writes. Used by DynamoDB, Cassandra, Riak, and Voldemort.
+
+### 1. Quorum Reads and Writes
+
+The client writes to W nodes and reads from R nodes out of a total of N replicas. As long as:
+
+`W + R > N`
+
+...at least one node in the read set will have the latest write, guaranteeing the client sees up-to-date data.
+
+Example with N=3:
+
+| W   | R   | Guarantee                    | Trade-off                              |
+| --- | --- | ---------------------------- | -------------------------------------- |
+| 2   | 2   | W+R=4 > 3 — consistent reads | Balanced                               |
+| 3   | 1   | W+R=4 > 3 — consistent reads | Writes slow (wait for all), reads fast |
+| 1   | 3   | W+R=4 > 3 — consistent reads | Writes fast, reads slow                |
+| 1   | 1   | W+R=2 < 3 — may read stale   | Fast but no consistency guarantee      |
+
+### 2. Sloppy Quorums and Hinted Handoff
+
+A key improvement in real systems is **sloppy quorums**. Normally, a write must go to the “correct” replica nodes. But if one is down, the system temporarily writes to another healthy node instead. That node stores a hint saying “this data belongs to node X,” and later forwards it when the original node comes back. This is called **hinted handoff**, and it keeps the system available even during failures.
+
+### 3. Anti-Entropy and Read Repair
+
+Leaderless systems use two mechanisms to keep replicas in sync:
+
+**Read repair**: When a client reads from R nodes and notices one returned stale data (outdated), it writes the newer value back to the stale node.
+
+**Anti-entropy process** : where nodes periodically compare data in the background and sync missing or outdated pieces.. Unlike leader-based replication, this doesn't guarantee any particular order.
+
+---
+
+# Chapter 10 Consistency Models and CAP in Practice
+
+## Three Librarians, One Book
+
+Imagine three librarians working at different desks in a large library. When someone checks out a book at desk A, how quickly do desks B and C learn about it?
+
+- **Strong consistency**: They sync after every single checkout. If you walk to desk B immediately after someone checked out a book at desk A, desk B already knows. Slow but always correct.
+
+- **Eventual consistency**: They sync at the end of the day. For most patrons this is fine -- they browse the catalog, pick a book, and it's on the shelf. But if two people want the same rare book, one of them might walk to the shelf and find it gone despite the catalog saying it was available.
+
+## The CAP Theorem
+
+- **Consistency (C):** Every read receives the most recent write or an error.
+- **Availability (A)**: Every request receives a non-error response (no guarantee it's the most recent).
+- **Partition tolerance (P)**: The system continues operating despite network partitions between nodes.
+
+**Partition tolerance isn't optional**. Networks fail. Packets get dropped. Switches die. You can't build a distributed system that simply ignores partitions. So the real choice is:
+
+- **CP** -- During a partition, reject requests rather than serve stale data. The system is consistent but not available.
+
+- **AP** -- During a partition, serve whatever data you have. The system is available but might return stale reads.
+
+```text
+                 C (Consistency)
+                /\
+               /  \
+              /    \
+          CP /      \ CA (only works if
+            /        \   no partitions)
+           /          \
+          /____________\
+     P (Partition       A (Availability)
+      Tolerance)
+            AP
+
+  During a partition, choose CP or AP.
+  CA only exists in a single-node system.
+```
+
+## The Consistency Spectrum
+
+CAP frames consistency as binary, but real systems live on a spectrum:
+
+### 1. Strong Consistency
+
+All reads reflect the most recent write. If you write balance = `\$500`, every subsequent read from any node returns `\$500`.
+
+**How it works** : Typically requires consensus protocols (Raft, Paxos) or synchronous replication. The write isn't acknowledged until a majority of nodes confirm it.
+
+**Used by** : Banking systems, ticket booking, inventory management. Anywhere double-selling or double-spending is unacceptable.
+
+**Cost** : Higher latency (must wait for quorum). Lower throughput. Cross-region replication adds 50-200ms per write.
+
+### 2. Causal Consistency
+
+Related events appear in the correct order. Unrelated events can be seen in any order.
+
+- **Example**: On a social platform, if Alice posts "I got the job!" and then Bob replies "Congrats!", causal consistency guarantees that no one ever sees Bob's reply without Alice's original post. But two unrelated posts by different users might appear in different orders on different replicas.
+
+- **How it works** : The system tracks causal dependencies between operations (often using vector clocks or logical timestamps).
+
+- **Used by** : Collaboration tools, social media comment threads, chat applications.
+
+### 3. Read-Your-Writes Consistency
+
+You always see your own updates immediately. Other users might see stale data for a short window.
+
+- **Example** : You update your profile bio on Instagram. When you refresh, you see the new bio instantly. Your friend across the country might see the old bio for a few seconds until replication catches up.
+
+- **How it works** : Route the user's reads to the same node that handled their writes (session affinity), or track the user's last write timestamp and ensure reads wait for replication to catch up to that point.
+
+- **Used by** : Social media profiles, user settings, shopping carts.
+
+### 4. Eventual Consistency
+
+All replicas converge to the same value over time, but there's no guarantee about how long that takes.
+
+**Example** : You update a DNS record. It might take minutes to hours for all DNS servers worldwide to reflect the change. But eventually they all will.
+
+**How it works** : Writes propagate asynchronously to all replicas. No synchronization required at write time.
+
+**Used by** : DNS, CDN caches, social media feeds, product catalogs.
+
+**Cost** : Cheapest in terms of latency and throughput. You pay with temporary inconsistency.
+
+```text
+Strong ←————————————————————————————→ Eventual
+  |          |              |              |
+  |     Causal      Read-your-writes       |
+  |                                        |
+Slowest,                            Fastest,
+most correct                     temporarily stale
+```
+
+## PACELC: The Full Picture
+
+CAP only tells half the story -- it's about what happens during partitions. But what about normal operations when everything is fine?
+
+**The PACELC theorem extends CAP:**
+
+> If there is a Partition, choose Availability or Consistency. Else (no partition), choose Latency or Consistency.
+
+Even when the network is healthy, there's still a trade-off. Synchronous replication gives you consistency but adds latency. Asynchronous replication gives you low latency but risks stale reads.
+
+## ACID vs BASE
+
+These two acronyms represent the two ends of the consistency spectrum applied to database transactions:
+
+| ACID                                                       | BASE                                                          |
+| ---------------------------------------------------------- | ------------------------------------------------------------- |
+| Stands for Atomicity, Consistency, Isolation, Durability   | Basically Available, Soft state, Eventually consistent        |
+| Consistency: Strong — transactions are all-or-nothing      | Consistency: Eventual — replicas converge over time           |
+| Availability: May reject writes to preserve consistency    | Availability: Prioritizes availability, tolerates stale reads |
+| Scale model: Vertical (bigger machine) or careful sharding | Scale model: Horizontal (add more nodes)                      |
+| Best for: Financial transactions, inventory, bookings      | Best for: Social feeds, product catalogs, analytics           |
+| Examples: PostgreSQL, MySQL, Spanner                       | Examples: DynamoDB, Cassandra, CouchDB                        |
+
+## Mixed Consistency: Design Per Feature, Not Per System
+
+Here's what experienced engineers know: **you don't pick one consistency model for your entire system**. You pick different models for different features based on their requirements.
+
+Take Ticketmaster:
+
+- **Seat availability for browsing**: Eventual consistency is fine. If the page shows 50 seats available and the true number is 48, nobody cares. The user hasn't committed to anything yet.
+- **Seat booking**: Strong consistency is mandatory. Two users cannot book the same seat. This path uses distributed locks or serializable transactions.
+- **Order confirmation emails**: Eventual consistency. The email can arrive a few seconds after the booking. No one notices.
+
+---
