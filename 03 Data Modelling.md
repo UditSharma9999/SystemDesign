@@ -953,3 +953,129 @@ Take Ticketmaster:
 - **Order confirmation emails**: Eventual consistency. The email can arrive a few seconds after the booking. No one notices.
 
 ---
+
+# Chapter 11 Concurrency Control and Isolation Levels
+
+## Why Concurrency Is Hard
+When transactions run one at a time (serially), everything is simple. Transaction A finishes, then Transaction B starts. No conflicts possible.
+
+But serial execution is slow. Modern databases run **transactions concurrently** — overlapping in time — to maximize throughput. The database's job is to make this concurrent execution appear as if transactions ran serially. How well it achieves this is defined by the isolation level.
+
+## The Four Isolation Levels
+SQL defines four isolation levels, from weakest to strongest. Each prevents more types of concurrency bugs, but costs more performance.
+
+
+### 1. Read Uncommitted (Weakest — Rarely Used)
+A transaction can read another transaction's uncommitted writes (dirty reads). Almost never used because it's unsafe — if the other transaction rolls back, you read data that never existed.
+
+### 2. Read Committed (The Practical Default)
+A transaction only sees data that has been committed. No dirty reads.
+
+Most databases default to this level (PostgreSQL, Oracle, SQL Server). It prevents dirty reads and dirty writes, but not all race conditions.
+
+#### What it doesn't prevent:
+```text
+Time     Transaction A              Transaction B
+─────────────────────────────────────────────────
+T1       SELECT balance → $1000
+T2                                  SELECT balance → $1000
+T3       UPDATE balance = $900
+T4       COMMIT
+T5                                  UPDATE balance = $900  ← lost A's update!
+T6                                  COMMIT
+```
+
+Both transactions `read $1000`, both `subtract $100`, both write $900. The result should be $800 but it's $900. Transaction A's update was `lost`. This is the lost `update problem`.
+
+### 3. Repeatable Read / Snapshot Isolation
+A transaction sees a consistent snapshot of the database from the moment it started. Even if other transactions commit changes, this transaction keeps seeing the old data.
+
+PostgreSQL's "Repeatable Read" is actually snapshot isolation (implemented with MVCC — see below).
+
+This prevents lost updates in most cases, and prevents read skew (seeing inconsistent data across multiple reads within one transaction).
+
+### 4. Serializable (Strongest)
+Transactions behave as if they executed one at a time. No concurrency anomalies possible. The database achieves this through actual serial execution, two-phase locking, or serializable snapshot isolation (SSI).
+
+**The cost**: Significantly slower. Transactions may **be aborted and retried if the database detects conflicts**.
+
+### Comparison
+| Level              | Dirty Reads | Lost Updates      | Read Skew | Write Skew | Performance |
+|--------------------|-------------|-------------------|------------|-------------|-------------|
+| Read Uncommitted   | Possible    | Possible          | Possible   | Possible    | Fastest     |
+| Read Committed     | Prevented   | Possible          | Possible   | Possible    | Fast        |
+| Repeatable Read    | Prevented   | Mostly prevented  | Prevented  | Possible    | Medium      |
+| Serializable       | Prevented   | Prevented         | Prevented  | Prevented   | Slowest     |
+
+## MVCC — Multi-Version Concurrency Control
+MVCC is the mechanism that makes snapshot isolation possible. Instead of locking rows when reading, the database keeps **multiple versions** of each row.
+
+
+```Text
+Row versions for user_id = 42:
+┌──────────┬──────────┬────────────┬────────────┐
+│ version  │ balance  │ created_by │ visible_to │
+├──────────┼──────────┼────────────┼────────────┤
+│    1     │  $1000   │  txn_100   │ txn < 200  │
+│    2     │   $900   │  txn_150   │ txn < 300  │
+│    3     │   $800   │  txn_250   │ txn ≥ 250  │  ← current
+└──────────┴──────────┴────────────┴────────────┘
+```
+When Transaction 200 reads this row, it sees version 2 ($900) — the latest version visible to it. Transaction 300 sees version 3 ($800). Neither blocks the other. Readers never block writers, writers never block readers.
+
+This is why PostgreSQL can handle thousands of concurrent reads without locking. Old versions are cleaned up by the VACUUM process after all transactions that might need them have finished.
+
+**Key insight from DDIA**: "Snapshot isolation is a boon for long-running, read-only queries such as backups and analytics. It is very hard to reason about data if it keeps changing while a query is running."
+
+## Solving the Concert Ticket Problem
+### Pessimistic vs Optimistic Locking
+**pessimistic locking**, the database assumes conflicts are likely, so it prevents other users from changing the data while one transaction is working on it. It does this by placing a lock on the row as soon as someone reads it for an update.
+
+In the concert ticket example, User A starts buying the last ticket and runs a query like SELECT ... FOR UPDATE. This locks that ticket row. While User A is completing the purchase, User B also tries to buy the same ticket, but now User B must wait because the row is locked. Once User A finishes and commits the transaction, the lock is released. Then User B can continue, but by that time the ticket status is already “sold,” so User B cannot buy it.
+
+The main **advantage** of pessimistic locking is safety: it avoids conflicts and prevents two users from updating the same data at the same time. It is useful when contention is high, such as ticket booking, banking, or inventory systems where conflicts are common and correctness is critical.
+
+The **downside** is that locking can reduce performance.
+
+With **optimistic locking**, the database does not immediately block anyone. Instead, both users are allowed to read the ticket as “available” and continue with the purchase process. Along with the ticket data, the database keeps a small number called a version (for example, version 5). When User A tries to buy the ticket, the database updates the row only if the version is still 5. Since no one changed it yet, the update succeeds, the ticket becomes “sold,” and the version changes to 6.
+
+Now User B also tries to buy the same ticket, but their update still expects version 5. The database checks and sees the version is already 6 because User A bought it first. So User B’s update affects 0 rows, which tells the application: “Someone else changed this ticket already.” The app can then **show an error or retry** the process.
+
+This approach is called optimistic because it assumes conflicts are rare. It works well when many users are reading data but only a few are changing it. The **advantage** is that nobody has to wait or get blocked, so the system is faster under normal conditions. The **downside** is that if many people try to update the same data at once, lots of transactions fail and must retry, which wastes some work.
+
+
+## Write Skew — The Subtle Race Condition
+Write skew occurs when two transactions read the same data, make decisions based on it, and write to different rows — but the combined result violates a constraint.
+
+**Example**: A hospital requires at least one doctor on call. Two doctors are on call. Both check "is there more than one doctor on call?" — both see "yes" — both remove themselves. Now zero doctors are on call.
+
+### Solutions:
+1. **Serializable isolation**: The database detects the conflict and aborts one transaction.
+2. **Materialized conflict**: Add a lock row that both transactions must acquire.
+3. **Application-level check**: Verify the constraint after the write and roll back if violated
+
+----
+
+# Chapter 12 Composite Indexes, Covering Indexes, and When NOT to Index
+A **composite index** is simply an index built on multiple columns, in a specific order. For example, an index on (department, last_name, date) is sorted first by department, then by last name inside each department, and finally by date inside each last name. Because of this order, the database can efficiently answer queries that start from the left side of the index. So it works for queries using (department), (department, last_name), or (department, last_name, date). But it does not help much for queries on just (last_name) or (date) because the data is not organized starting from those columns. This is called the leftmost prefix rule.
+
+A **covering index** goes one step further. Normally, when the database finds matching rows in an index, it still has to go back to the main table (called the heap) to fetch the remaining columns. But if the index already contains every column the query needs, the database can answer the query directly from the index itself. That saves extra disk reads and makes queries faster. For example, if your query only needs name and email, and both are already stored in the index, the database never touches the main table.
+
+A **partial index** indexes only some rows instead of the entire table. For example, if most users are inactive but your application mostly searches active users, you could create an index only on rows where status = 'active'. This keeps the index much smaller and faster because it ignores data you rarely query.
+
+## Composite Indexes
+### The Leftmost Prefix Rule
+The index can be used for queries that filter on a leftmost prefix of the index columns:
+
+- Put equality conditions (=) first
+- Put range conditions (>, <, BETWEEN) last
+- Among equality columns, put the most selective/high-cardinality column first.
+
+
+## Covering Indexes — Never Touch the Heap
+A covering index is an index that contains everything a query needs, so the database never has to go back to the main table to fetch extra data. This matters because a normal index lookup usually happens in two steps:
+
+1. Use the index to find matching rows
+2. Go to the actual table (heap/clustered storage) to fetch the remaining columns.
+
+That second step is expensive because it often means extra random disk reads.
