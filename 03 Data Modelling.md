@@ -957,23 +957,27 @@ Take Ticketmaster:
 # Chapter 11 Concurrency Control and Isolation Levels
 
 ## Why Concurrency Is Hard
+
 When transactions run one at a time (serially), everything is simple. Transaction A finishes, then Transaction B starts. No conflicts possible.
 
 But serial execution is slow. Modern databases run **transactions concurrently** — overlapping in time — to maximize throughput. The database's job is to make this concurrent execution appear as if transactions ran serially. How well it achieves this is defined by the isolation level.
 
 ## The Four Isolation Levels
+
 SQL defines four isolation levels, from weakest to strongest. Each prevents more types of concurrency bugs, but costs more performance.
 
-
 ### 1. Read Uncommitted (Weakest — Rarely Used)
+
 A transaction can read another transaction's uncommitted writes (dirty reads). Almost never used because it's unsafe — if the other transaction rolls back, you read data that never existed.
 
 ### 2. Read Committed (The Practical Default)
+
 A transaction only sees data that has been committed. No dirty reads.
 
 Most databases default to this level (PostgreSQL, Oracle, SQL Server). It prevents dirty reads and dirty writes, but not all race conditions.
 
 #### What it doesn't prevent:
+
 ```text
 Time     Transaction A              Transaction B
 ─────────────────────────────────────────────────
@@ -988,6 +992,7 @@ T6                                  COMMIT
 Both transactions `read $1000`, both `subtract $100`, both write $900. The result should be $800 but it's $900. Transaction A's update was `lost`. This is the lost `update problem`.
 
 ### 3. Repeatable Read / Snapshot Isolation
+
 A transaction sees a consistent snapshot of the database from the moment it started. Even if other transactions commit changes, this transaction keeps seeing the old data.
 
 PostgreSQL's "Repeatable Read" is actually snapshot isolation (implemented with MVCC — see below).
@@ -995,21 +1000,23 @@ PostgreSQL's "Repeatable Read" is actually snapshot isolation (implemented with 
 This prevents lost updates in most cases, and prevents read skew (seeing inconsistent data across multiple reads within one transaction).
 
 ### 4. Serializable (Strongest)
+
 Transactions behave as if they executed one at a time. No concurrency anomalies possible. The database achieves this through actual serial execution, two-phase locking, or serializable snapshot isolation (SSI).
 
 **The cost**: Significantly slower. Transactions may **be aborted and retried if the database detects conflicts**.
 
 ### Comparison
-| Level              | Dirty Reads | Lost Updates      | Read Skew | Write Skew | Performance |
-|--------------------|-------------|-------------------|------------|-------------|-------------|
-| Read Uncommitted   | Possible    | Possible          | Possible   | Possible    | Fastest     |
-| Read Committed     | Prevented   | Possible          | Possible   | Possible    | Fast        |
-| Repeatable Read    | Prevented   | Mostly prevented  | Prevented  | Possible    | Medium      |
-| Serializable       | Prevented   | Prevented         | Prevented  | Prevented   | Slowest     |
+
+| Level            | Dirty Reads | Lost Updates     | Read Skew | Write Skew | Performance |
+| ---------------- | ----------- | ---------------- | --------- | ---------- | ----------- |
+| Read Uncommitted | Possible    | Possible         | Possible  | Possible   | Fastest     |
+| Read Committed   | Prevented   | Possible         | Possible  | Possible   | Fast        |
+| Repeatable Read  | Prevented   | Mostly prevented | Prevented | Possible   | Medium      |
+| Serializable     | Prevented   | Prevented        | Prevented | Prevented  | Slowest     |
 
 ## MVCC — Multi-Version Concurrency Control
-MVCC is the mechanism that makes snapshot isolation possible. Instead of locking rows when reading, the database keeps **multiple versions** of each row.
 
+MVCC is the mechanism that makes snapshot isolation possible. Instead of locking rows when reading, the database keeps **multiple versions** of each row.
 
 ```Text
 Row versions for user_id = 42:
@@ -1021,6 +1028,7 @@ Row versions for user_id = 42:
 │    3     │   $800   │  txn_250   │ txn ≥ 250  │  ← current
 └──────────┴──────────┴────────────┴────────────┘
 ```
+
 When Transaction 200 reads this row, it sees version 2 ($900) — the latest version visible to it. Transaction 300 sees version 3 ($800). Neither blocks the other. Readers never block writers, writers never block readers.
 
 This is why PostgreSQL can handle thousands of concurrent reads without locking. Old versions are cleaned up by the VACUUM process after all transactions that might need them have finished.
@@ -1028,7 +1036,9 @@ This is why PostgreSQL can handle thousands of concurrent reads without locking.
 **Key insight from DDIA**: "Snapshot isolation is a boon for long-running, read-only queries such as backups and analytics. It is very hard to reason about data if it keeps changing while a query is running."
 
 ## Solving the Concert Ticket Problem
+
 ### Pessimistic vs Optimistic Locking
+
 **pessimistic locking**, the database assumes conflicts are likely, so it prevents other users from changing the data while one transaction is working on it. It does this by placing a lock on the row as soon as someone reads it for an update.
 
 In the concert ticket example, User A starts buying the last ticket and runs a query like SELECT ... FOR UPDATE. This locks that ticket row. While User A is completing the purchase, User B also tries to buy the same ticket, but now User B must wait because the row is locked. Once User A finishes and commits the transaction, the lock is released. Then User B can continue, but by that time the ticket status is already “sold,” so User B cannot buy it.
@@ -1043,20 +1053,22 @@ Now User B also tries to buy the same ticket, but their update still expects ver
 
 This approach is called optimistic because it assumes conflicts are rare. It works well when many users are reading data but only a few are changing it. The **advantage** is that nobody has to wait or get blocked, so the system is faster under normal conditions. The **downside** is that if many people try to update the same data at once, lots of transactions fail and must retry, which wastes some work.
 
-
 ## Write Skew — The Subtle Race Condition
+
 Write skew occurs when two transactions read the same data, make decisions based on it, and write to different rows — but the combined result violates a constraint.
 
 **Example**: A hospital requires at least one doctor on call. Two doctors are on call. Both check "is there more than one doctor on call?" — both see "yes" — both remove themselves. Now zero doctors are on call.
 
 ### Solutions:
+
 1. **Serializable isolation**: The database detects the conflict and aborts one transaction.
 2. **Materialized conflict**: Add a lock row that both transactions must acquire.
 3. **Application-level check**: Verify the constraint after the write and roll back if violated
 
-----
+---
 
 # Chapter 12 Composite Indexes, Covering Indexes, and When NOT to Index
+
 A **composite index** is simply an index built on multiple columns, in a specific order. For example, an index on (department, last_name, date) is sorted first by department, then by last name inside each department, and finally by date inside each last name. Because of this order, the database can efficiently answer queries that start from the left side of the index. So it works for queries using (department), (department, last_name), or (department, last_name, date). But it does not help much for queries on just (last_name) or (date) because the data is not organized starting from those columns. This is called the leftmost prefix rule.
 
 A **covering index** goes one step further. Normally, when the database finds matching rows in an index, it still has to go back to the main table (called the heap) to fetch the remaining columns. But if the index already contains every column the query needs, the database can answer the query directly from the index itself. That saves extra disk reads and makes queries faster. For example, if your query only needs name and email, and both are already stored in the index, the database never touches the main table.
@@ -1064,18 +1076,180 @@ A **covering index** goes one step further. Normally, when the database finds ma
 A **partial index** indexes only some rows instead of the entire table. For example, if most users are inactive but your application mostly searches active users, you could create an index only on rows where status = 'active'. This keeps the index much smaller and faster because it ignores data you rarely query.
 
 ## Composite Indexes
+
 ### The Leftmost Prefix Rule
+
 The index can be used for queries that filter on a leftmost prefix of the index columns:
 
 - Put equality conditions (=) first
 - Put range conditions (>, <, BETWEEN) last
 - Among equality columns, put the most selective/high-cardinality column first.
 
-
 ## Covering Indexes — Never Touch the Heap
+
 A covering index is an index that contains everything a query needs, so the database never has to go back to the main table to fetch extra data. This matters because a normal index lookup usually happens in two steps:
 
 1. Use the index to find matching rows
 2. Go to the actual table (heap/clustered storage) to fetch the remaining columns.
 
 That second step is expensive because it often means extra random disk reads.
+
+For example, imagine an index on (user_id, status). If you run a query asking only for user_id and status, the database can answer directly from the index because those columns are already stored there. But if the query also asks for total_amount, the database must jump back to the table for every matching row since total_amount is missing from the index. That extra step is called a **heap fetch** in PostgreSQL or a **key lookup** in SQL Server.
+
+### (IMP) Same Index, Different Queries — The Key Insight
+
+A covering index can feel confusing because it sounds like the database already “knows the answer” before the query runs. But that is not what happens.
+
+The database is not storing query results. It is only storing data in a smarter structure so queries can read directly from the index instead of repeatedly visiting the main table.
+
+Think of a table as a big book containing complete information.
+
+Example table:
+| id | user_id | status | total_amount |
+| -- | ------- | -------- | ------------ |
+| 1 | 5 | active | 100 |
+| 2 | 5 | active | 200 |
+| 3 | 8 | inactive | 300 |
+
+Now suppose we create this index:
+
+```sql
+CREATE INDEX idx_orders
+ON orders(user_id, status, total_amount);
+```
+
+This index is like a smaller, organized copy containing only these columns.  
+Now imagine this query:
+
+```sql
+SELECT total_amount
+FROM orders
+WHERE user_id = 5
+AND status = 'active';
+```
+
+What does the database need?
+
+        user_id → for filtering
+        status → for filtering
+        total_amount → for output
+
+All three columns already exist inside the index.
+
+So the database can:
+
+1. Search the index
+2. Find matching rows
+3. Read total_amount
+4. Return results
+
+It never opens the main table.
+
+Now let’s change the query:
+
+```sql
+SELECT id
+FROM orders
+WHERE user_id = 5
+AND status = 'active';
+```
+
+`id` is NOT inside the index.
+
+So the database:
+
+1. Searches the index
+2. Finds matching rows
+3. Uses pointers to go back to the main table
+4. Reads id
+
+Now the index is NOT covering.
+
+### Making an Index Covering with INCLUDE
+
+`(total_amount)` These are NOT used for searching or sorting.
+
+They are only stored at the bottom (leaf pages) of the index as extra attached data.
+
+Think of it like:  
+`(user_id, status)  ---> extra payload: total_amount`
+
+So when query runs:
+
+```sql
+SELECT total_amount
+FROM orders WHERE user_id = 5 AND status = 'active';
+```
+
+The database:
+
+- Uses (user_id, status) to quickly find rows
+- Reads total_amount directly from the index leaf
+- Never touches the main table
+
+Why not make `total_amount` a normal key column?  
+tree becomes larger, sorting becomes more expensive, traversal slower,maintenance cost higher
+
+![Text27](/assets/27.png)
+
+**Downside** is that indexes become larger because they store more data, which increases storage and maintenance costs.
+
+There are also some important caveats. Covering indexes are fragile: if a query later adds one more column that is not present in the index, the database immediately falls back to heap lookups and performance can drop.
+
+## Partial Indexes — Index Only What Matters
+
+A partial index is an index that stores only the rows you actually care about searching. Normally, a database index contains entries for every row in a table, even if most of those rows are rarely queried. This can make the index large and slower to search. A partial index solves this by indexing only rows that match a specific condition. For example, if an orders table mostly contains `completed` orders but your application frequently searches only for `pending` orders, you can create an index only for rows where `status = 'pending'`. This makes the index much smaller because it ignores all completed orders. Smaller indexes use less memory, require fewer disk reads, and are faster to search.
+
+The database can use this index only for queries that match the same condition. So a query searching for pending orders can use the partial index, but a query searching for completed orders cannot because those rows were never added to the index. Partial indexes are especially useful for things like active users, unprocessed jobs, soft-deleted records, or recent important data where only a small portion of the table is queried often.
+
+One important limitation is that the condition must remain stable. You cannot create a partial index using something dynamic like `WHERE created_at > now()` because the meaning changes constantly as time passes. Databases require the condition to be fixed so the index remains valid. That is why people often use a hardcoded date or periodically recreate the index if they need a rolling “recent data” window.
+
+## Some extra topics
+
+### GIN Indexes — For JSON and Arrays
+
+### GiST Indexes — For Geospatial Queries
+
+### BRIN Indexes — Tiny Indexes for Huge, Ordered Tables
+
+### Bloom Filters — Probabilistic "Maybe" Checks
+
+A Bloom filter isn't an index in the traditional sense. It's a space-efficient probabilistic data structure that answers one question: "Is this element possibly in the set?"
+
+A Bloom filter can tell you:
+
+- **Definitely not here** — 100% certain, skip this file/page
+- **Possibly here** — might be a false positive, need to check
+
+It can never give a false negative. If the Bloom filter says "not here," the element is guaranteed absent.
+
+Bloom filters are used heavily inside LSM tree databases (Cassandra, RocksDB) to avoid reading SSTables that definitely don't contain the key. They're also used in PostgreSQL (via the bloom extension) for multi-column approximate matching.
+
+## When NOT to Index
+
+Every index you add has costs: slower writes, more disk space, more memory pressure on the buffer pool. Here's when adding an index is the wrong move:
+
+- **Write-heavy tables**: If a table has 5 indexes, every INSERT does roughly 6 writes — one to the heap and one to each index. For a logging table receiving 100,000 inserts per second, those extra writes add up fast. UPDATEs can be worse.
+
+- **Small tables**: A table with 1,000 rows fits in a handful of pages. A sequential scan of 5 pages is faster than traversing a B-tree.
+
+- **Low cardinality columns**: An index on a gender column with 3 distinct values is nearly useless. The index points to ~33% of the table for each value — the database would rather just scan the whole table.
+
+- **Rarely queried columns**: An index that nobody queries is pure waste — it slows down writes and consumes disk space for zero benefit.
+
+## The Interview Index Selection Strategy
+
+When an interviewer asks about indexes for a table, follow this framework:
+
+1. **Identify the hot queries** — what does the application query most?
+2. **Look at WHERE and JOIN columns** — those are index candidates
+3. **Check ORDER BY** — can an index provide the sort order?
+4. **Consider composite indexes** — one index serving multiple queries beats multiple single-column indexes
+5. **Check for covering potential** — can you add INCLUDE columns to avoid heap lookups?
+6. **Consider the write load** — every index costs on writes
+
+Then verify: run the real query under EXPLAIN ANALYZE and confirm the planner actually picks your index. An index the optimizer ignores is just write overhead.
+
+> Need to revisit this topic.
+
+---
