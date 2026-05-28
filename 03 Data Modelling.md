@@ -1575,3 +1575,5 @@ The problem: all writes go to the newest shard.
 The March shard gets hammered while January and February sit idle. You've turned a distributed system into a single-writer bottleneck -- exactly what sharding was supposed to fix.
 
 If you need time-based access patterns, shard by something else (`user_id`) and **partition** within each shard by time. You get the write distribution from sharding and the time-range pruning from partitioning.
+
+---
