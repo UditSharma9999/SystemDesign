@@ -1253,3 +1253,325 @@ Then verify: run the real query under EXPLAIN ANALYZE and confirm the planner ac
 > Need to revisit this topic.
 
 ---
+
+# Chapter 13 Query Patterns That Break at Scale
+
+## The N+1 Query Problem
+
+**What It Is** : You query a list of posts, then for each post, make a separate query to get the author. 1 query for posts + N queries for authors = N+1 queries.
+
+51 database round trips to load one page. Each round trip has network latency .
+
+**Four Solutions**
+**1. Eager loading (JOIN):**
+
+```sql
+SELECT posts.*, users.username, users.avatar_url
+FROM posts
+JOIN users ON posts.user_id = users.id
+LIMIT 50;
+```
+
+One query. One round trip. The database handles the join.
+
+**2. Batch loading (WHERE IN):**
+
+```sql
+-- First query: get posts
+SELECT * FROM posts LIMIT 50;
+-- Second query: get all authors at once
+SELECT * FROM users WHERE id IN (1, 2, 3, 5, 8, 13, ...);
+```
+
+Two queries instead of 51. Your application code matches them up.
+
+**3. DataLoader pattern**:  
+Used in GraphQL and modern ORMs. Batches individual lookups within a single tick/request cycle into one query automatically.
+
+**4. Subquery:**
+
+```sql
+SELECT * FROM users WHERE id IN (
+    SELECT DISTINCT user_id FROM posts ORDER BY created_at DESC LIMIT 50
+);
+```
+
+## Offset Pagination — The Silent Killer
+
+### How Offset Works
+
+```sql
+-- Page 1 (fast)
+SELECT * FROM posts ORDER BY created_at DESC LIMIT 20 OFFSET 0;
+
+-- Page 100 (slow!)
+SELECT * FROM posts ORDER BY created_at DESC LIMIT 20 OFFSET 1980;
+```
+
+Offset pagination is the traditional way websites load pages of data.
+
+When you use `OFFSET 1980`, the database reads and sorts all those earlier rows (`2000`), throws most of them away, and finally returns only 20 results. This wasted work becomes very expensive as the page number grows larger. That’s why deep pagination becomes slow.
+
+### Cursor-Based Pagination (The Fix)
+
+Instead of "skip N rows," use a cursor — the last value you saw:  
+"it says “start after this specific item.” The database remembers the last item shown and continues from there.
+
+```sql
+-- First page
+SELECT * FROM posts
+ORDER BY created_at DESC
+LIMIT 20;
+
+-- Next page (cursor = timestamp of last item)
+SELECT * FROM posts
+WHERE created_at < '2024-03-15T10:30:00Z'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+**The trade-off**: You can't jump to "page 500" directly — you can only go forward/backward from a cursor.
+
+### Keyset Pagination for Ties
+
+If multiple rows share the same created_at, the cursor is ambiguous. Fix with a composite cursor:
+
+```sql
+SELECT * FROM posts
+WHERE (created_at, id) < ('2024-03-15T10:30:00Z', 12345)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+This requires an index on (created_at, id) and guarantees uniqueness.
+
+### Real-Time Insertions and Duplicate Items
+
+Cursor pagination is also much better for real-time applications like social media feeds, chat apps, or notifications. With offset pagination, if new posts are inserted while a user is scrolling, the positions of rows shift. This can cause duplicate items or missing items between pages. Cursor pagination avoids this because the cursor points to a fixed item in the dataset, so new insertions above it do not affect the next query.
+
+## Aggregation at Scale
+
+### COUNT(\*) Is Expensive
+
+```sql
+SELECT COUNT(*) FROM likes WHERE post_id = 42;
+```
+
+On a post with 3 million likes, this scans 3 million rows (even with an index, it must count each qualifying entry). Doing this on every page load is a disaster.
+
+#### Solutions:
+
+1. **Pre-computed counters (most common)**: Store `like_count` on the posts table. Increment/decrement atomically on each like/unlike. Accept minor drift, reconcile periodically.
+
+2. **Approximate counts (HyperLogLog)**: For very large counts where exact numbers don't matter (unique visitors, distinct values), HyperLogLog gives ~2% accuracy with a fixed 12KB of memory. Redis supports this natively with `PFADD` and `PFCOUNT`.
+
+3. **Cached counts**: Compute the count periodically (every minute, every hour) and cache the result. Show "~3.2M likes" instead of "3,247,891 likes."
+
+### Aggregation Across Partitions
+
+If your data is partitioned or sharded, aggregations become scatter-gather operations: query each partition, sum the results. This is inherently expensive. Pre-compute when possible.
+
+## Connection Exhaustion
+
+### The Problem
+
+Every database connection consumes resources.
+
+PostgreSQL typically supports 100-500 max connections. With 50 microservice instances, each wanting 20 connections: 1,000 connections. You've exceeded the limit.
+
+## Connection Pooling — The Solution
+
+**Client-side pooling (HikariCP, SQLAlchemy pool)**: Each application instance maintains a small pool of reusable connections. Instead of opening/closing a connection per query, you borrow one from the pool and return it when done. Avoids the overhead of TCP handshake + authentication per query.
+
+**Server-side pooling (PgBouncer)**: Sits between all application instances and the database. Multiplexes thousands of client connections into a small number of real database connections.
+
+![Text28](/assets/28.png)
+
+PgBouncer's **transaction mode** is the most efficient: a real connection is allocated only for the duration of a transaction, then returned to the pool. Between queries, no connection is held.
+
+**Best practice**: Use both. HikariCP for fast local reuse within each application instance. PgBouncer for protecting the database from connection storms across all instances.
+
+## Read Replicas
+
+When read load overwhelms a single server, add read replicas — copies of the database that handle read queries:
+
+![Text29](/assets/29.png)
+
+**Replication lag**: Replicas are eventually consistent — there's a delay (milliseconds to seconds) between a write on the primary and its appearance on replicas.
+
+**Read-your-writes consistency**: After a user updates their profile, route their reads to the primary for a few seconds to ensure they see their own changes. Other users can read from replicas (slight staleness is fine).
+
+---
+
+# Chapter 14 Partitioning — Splitting Data Within One Database
+
+Imagine a database table that stores millions of records over many years, like invoices, logs, or user activity. If all that data sits in one giant table, every query has to search through a huge amount of information, even when you only need a small part of it. That slows things down.
+
+## What Partitioning Actually Is
+
+**Key point**: `no additional servers`. Partitioning is a single-machine optimization. It improves query speed, simplifies maintenance, and can even help with concurrency -- but it doesn't increase your total storage or write throughput beyond what that one machine offers.
+
+### Horizontal vs Vertical Partitioning
+
+**Horizontal partitioning** splits a table by rows. Each partition contains a subset of the records, but still keeps all the columns. Imagine a giant orders table where each row is an order. You could store orders from 2023 in one partition and orders from 2024 in another. When someone queries only recent orders, the database can ignore older partitions completely. This is the most common form of partitioning because large systems usually grow by accumulating more rows over time.
+
+**Vertical partitioning** works differently. Instead of splitting rows, it splits columns. One table might store frequently accessed columns like user_id, name, and email, while another stores less commonly used data like bio, avatar_url, or large profile settings. Both tables still refer to the same users, but the data is separated based on how often it is accessed.
+
+## PostgreSQL PARTITION BY -- Range, List, Hash
+
+**Range Partitioning**:
+Split rows based on a continuous range of values. The classic use case is time-series data.
+
+**List Partitioning** :
+Split rows based on a discrete set of values. Great for geographic or categorical data.
+
+**Hash Partitioning**
+Split rows by hashing a column value. Useful when there's no natural range or list, but you still want even distribution.
+
+## Partition Pruning -- The Real Performance Win
+
+The real power of partitioning is not just splitting a table into smaller pieces — it’s something called partition pruning. This is the database’s ability to completely ignore partitions that cannot contain the requested data.
+
+Suppose a huge events table is partitioned by date. One partition stores Q1 data, another Q2, another Q3, and so on. When a query includes the partition key in the WHERE clause — such as created_at = '2024-08-15' — PostgreSQL can determine that only the Q3 partition could possibly contain that date. The query `planner` then skips all other partitions entirely.
+
+## Maintenance -- DROP Instead of DELETE
+
+Here's a benefit that doesn't get enough attention: dropping old data becomes trivial.
+
+Suppose you have a data retention policy -- events older than 2 years get deleted. Without partitioning:
+
+```sql
+-- Without partitioning: slow, generates massive WAL, locks the table
+DELETE FROM events WHERE created_at < '2022-01-01';
+-- Could take hours on a billion-row table
+```
+
+With partitioning:
+
+```sql
+-- Without partitioning: slow, generates massive WAL, locks the table
+DELETE FROM events WHERE created_at < '2022-01-01';
+-- Could take hours on a billion-row table
+```
+
+`DROP TABLE` is a metadata operation. It takes milliseconds regardless of how many rows are in the partition. No dead tuples, no bloat, no VACUUM needed. This alone makes partitioning worth it for time-series data.
+
+Similarly, adding new partitions for upcoming time periods is cheap:
+
+```sql
+CREATE TABLE events_2025_q1 PARTITION OF events
+    FOR VALUES FROM ('2025-01-01') TO ('2025-04-01');
+```
+
+### Sub-Partitioning -- Going Deeper
+
+Sometimes a single level of partitioning is not enough for very large datasets. In those cases, databases can use sub-partitioning, which means partitioning an already partitioned table
+
+## When to Partition
+
+Partitioning is not free. It adds complexity to schema management and can hurt queries that don't include the partition key. Here's a practical decision guide:
+
+| Situation                                                 | Partition? | Why                                      |
+| --------------------------------------------------------- | ---------- | ---------------------------------------- |
+| Table has 10M+ rows and growing                           | Yes        | Pruning gives measurable speedup         |
+| Queries almost always filter by one column (date, region) | Yes        | Natural partition key exists             |
+| Time-series data with retention policy                    | Yes        | `DROP PARTITION` enables instant cleanup |
+| Small table (under 1M rows)                               | No         | Full scans are already fast              |
+| Queries touch random rows across all ranges               | No         | Pruning can't help and adds overhead     |
+| Table has many indexes that are getting slow to maintain  | Yes        | Smaller per-partition indexes are faster |
+
+> **You have a 2-billion-row events table partitioned by RANGE on created_at (one partition per month). A query runs: SELECT \* FROM events WHERE user_id = 42. What happens?**  
+> The planner scans every partition because the WHERE clause doesn't include the partition key
+
+---
+
+# Chapter 15 Sharding — Splitting Data Across Machines
+
+Instead of storing all data in one massive database server, the data is split across multiple independent databases called **shards**
+
+## Why Shard at All?
+
+Partitioning (from the previous lesson) splits data on a single machine. Sharding splits it across machines. You reach for sharding when a single machine hits hard limits.
+
+## Three Sharding Strategies
+
+### 1. Hash-Based Sharding (Most Common)
+
+Apply a hash function to the shard key and use modulo to pick the shard:
+
+`shard_number = hash(shard_key) % number_of_shards`
+
+A shard-aware query router is just a few extra lines.
+
+That's the entire sharding proxy concept — hash the key, pick the connection, forward the query.
+
+**Pros**: Distributes data evenly regardless of key patterns. Simple to implement.
+
+**Cons**: Adding or removing shards changes the modulo, causing massive data migration. Range queries across shards are expensive.
+
+### 2. Range-Based Sharding
+
+Assign contiguous ranges of the shard key to each shard:
+
+        Shard 0: user_id     1 - 1,000,000
+        Shard 1: user_id 1,000,001 - 2,000,000
+        Shard 2: user_id 2,000,001 - 3,000,000
+        Shard 3: user_id 3,000,001 - 4,000,000
+
+**Pros**: Range queries on the shard key are efficient (only hit relevant shards). Easy to understand and debug.
+
+**Cons**: Uneven distribution if the key isn't uniformly distributed. New users all land on the newest shard, creating a hot spot.
+
+### 3. Directory-Based Sharding
+
+Maintain a lookup table that maps each shard key to its shard:
+
+        ┌────────────┬───────────┐
+        │ tenant_id  │ shard     │
+        ├────────────┼───────────┤
+        │ acme-corp  │ shard-2   │
+        │ globex     │ shard-1   │
+        │ initech    │ shard-3   │
+        │ umbrella   │ shard-2   │
+        └────────────┴───────────┘
+
+**Pros**: Maximum flexibility. You can move individual tenants between shards without any algorithmic change. Great for multi-tenant SaaS.
+
+**Cons**: The directory is a single point of failure and a potential bottleneck. Every query requires a lookup before it can be routed.
+
+## Strategy Comparison
+
+| Strategy        | Distribution | Range Queries      | Adding Shards       | Flexibility | SPOF Risk        |
+| --------------- | ------------ | ------------------ | ------------------- | ----------- | ---------------- |
+| Hash-based      | Excellent    | Poor (scatter)     | Expensive (rehash)  | Low         | None             |
+| Range-based     | Risky (skew) | Excellent          | Moderate            | Medium      | None             |
+| Directory-based | Controllable | Depends on mapping | Easy (update table) | High        | Directory itself |
+
+> In a system design interview, default to hash-based sharding unless the problem specifically involves range queries or multi-tenant isolation. Say something like: "I'll use hash-based sharding on user_id because it gives even distribution and our primary access pattern is per-user lookups." Then mention the resharding challenge and that you'd use consistent hashing (next lesson) to mitigate it.
+
+## Choosing the Right Shard Key
+
+The shard key is the most important decision in a sharding architecture. Get it wrong, and you'll spend months fixing it. Here's what makes a good shard key:
+
+**High cardinality**. The key must have enough distinct values to distribute across all shards. A boolean column (`is_active`) has cardinality 2 -- useless for 16 shards.
+
+**Even distribution**. Values should spread roughly equally. If 80% of your data has `country = 'US'`, sharding by country puts 80% of data on one shard.
+
+**Query alignment**. Your most common queries should include the shard key, so they can be routed to a single shard. If you shard by `user_id` but most queries filter by `order_date`, every query becomes a cross-shard scatter.
+
+## The Time-Range Sharding Anti-Pattern
+
+> 🔴 Don't Shard by Timestamp  
+> Sharding by time range makes the newest shard a write hot spot — 100% of new writes hit one machine while historical shards sit idle. This turns your distributed system back into a single-writer bottleneck.
+
+This one catches people. It seems logical: shard by month or year, since time-series data is often queried by time range.
+
+The problem: all writes go to the newest shard.
+
+        January shard:  0 new writes, 30M existing rows (cold)
+        February shard: 0 new writes, 28M existing rows (cold)
+        March shard:    ALL new writes (hot!)
+
+The March shard gets hammered while January and February sit idle. You've turned a distributed system into a single-writer bottleneck -- exactly what sharding was supposed to fix.
+
+If you need time-based access patterns, shard by something else (`user_id`) and **partition** within each shard by time. You get the write distribution from sharding and the time-range pruning from partitioning.
