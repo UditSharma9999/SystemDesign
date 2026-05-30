@@ -1577,3 +1577,776 @@ The March shard gets hammered while January and February sit idle. You've turned
 If you need time-based access patterns, shard by something else (`user_id`) and **partition** within each shard by time. You get the write distribution from sharding and the time-range pruning from partitioning.
 
 ---
+
+# Chapter 16 Consistent Hashing and Resharding
+
+The Problem With Simple Hashing
+
+In the previous lesson, we used `shard = hash(key) % N` to distribute data. It works beautifully — until you need more shards.
+
+Imagine you have 4 shards and a key with hash value 14:
+
+- **14 % 4 = 2** → goes to Shard 2
+
+Now you add a 5th shard:
+
+- **14 % 5 = 4** → goes to Shard 4
+
+That key just moved. And it's not alone — roughly 75% of all keys remap when you go from 4 to 5 shards. That means moving 75% of your data across the network. During a resharding event, your system is effectively doing a massive, expensive data migration.
+
+![Text30](/assets/30.png)
+
+## Consistent Hashing — The Ring
+
+Consistent hashing can be thought of as placing both your data (keys) and your servers (shards) on a big circular ring. Every shard is assigned a position on the ring by hashing its name, and every key is also assigned a position by hashing the key value. To find where a key belongs, you start at the key's position and move clockwise around the ring until you encounter the first shard. That shard stores the key.
+
+![Text31](/assets/31.png)
+
+**How it works:**
+
+1. Hash each shard's identifier to a position on the ring
+2. Hash each key to a position on the ring
+3. Each key is assigned to the next shard clockwise on the ring
+
+Adding a shard: When Shard E is added between Shard B and Shard C, only the keys between B and E need to move to E. All other keys stay where they are.
+
+```py
+import bisect, hashlib
+
+class ConsistentHash:
+    def __init__(self):
+        self.ring = []          # sorted list of (hash_position, shard_name)
+        self.nodes = {}
+
+    def add_shard(self, name, vnodes=150):
+        for i in range(vnodes):
+            h = int(hashlib.md5(f"{name}:{i}".encode()).hexdigest(), 16)
+            bisect.insort(self.ring, (h, name))
+
+    def get_shard(self, key):
+        h = int(hashlib.md5(key.encode()).hexdigest(), 16)
+        idx = bisect.bisect_right(self.ring, (h,))
+        if idx == len(self.ring):
+            idx = 0              # wrap around the ring
+        return self.ring[idx][1]
+```
+
+adding a server might force almost all data to be redistributed. With consistent hashing, only the data that falls near the new server needs to move. Everything else stays where it is. For example, if you have 4 servers and add a 5th one, only about 20% of the data moves instead of most of it.
+
+## Virtual Nodes — Evening Things Out
+
+Basic **consistent hashing has a problem**: with only a few physical nodes, the ring can be unevenly divided. One shard might own 40% of the ring while another owns 10%.
+
+Virtual nodes (vnodes) fix this by giving each physical shard multiple positions on the ring.
+
+- Instead of placing each physical shard on the ring once, we place it many times.
+
+```
+Physical Shard A:
+A1, A2, A3, A4
+
+Physical Shard B:
+B1, B2, B3, B4
+```
+
+The ring now looks like:
+
+```
+A1 -> B1 -> A2 -> B2 -> A3 -> B3 -> A4 -> B4
+```
+
+When a key lands between: `A2 ----- B2` it belongs to Shard B.
+When it lands between: `B2 ----- A3` it belongs to Shard A.
+
+Since each physical shard owns many small sections scattered around the ring, the total amount of data per shard becomes much more balanced.
+
+**What happens when a new shard is added?**
+Suppose each shard has many virtual nodes:
+
+```text
+A1 A2 A3 ...
+B1 B2 B3 ...
+C1 C2 C3 ...
+```
+
+Now add Shard D:
+
+```text
+D1 D2 D3 ...
+```
+
+These new virtual nodes are spread all over the ring.
+
+Instead of taking one large chunk from a single shard, D takes many small chunks from A, B, and C:
+
+```text
+A loses a little
+B loses a little
+C loses a little
+```
+
+With hundreds of virtual nodes per physical shard, the distribution becomes statistically even. When a physical shard is added or removed, its virtual nodes are scattered around the ring, so the data movement is evenly distributed across all other shards.
+
+| Approach                    | Keys moved on resize  | Distribution evenness |
+| --------------------------- | --------------------- | --------------------- |
+| Modulo hashing              | ~(N−1)/N (nearly all) | Perfect               |
+| Consistent hashing (basic)  | ~1/N                  | Uneven with few nodes |
+| Consistent hashing + vnodes | ~1/N                  | Even                  |
+
+## Resharding in Production
+
+> "What do you do when one shard becomes too big and you need more shards, but your system is serving millions of requests per second?"
+
+Theory is clean. Production is messy. Here's how real systems handle resharding:
+
+### 1. Vitess (YouTube, Slack, GitHub)
+
+Used by companies like YouTube, Slack, and GitHub.
+
+Imagine you have:
+
+```text
+Shard 1
+ ├── User 1-100M
+```
+
+The shard becomes too large.
+
+Vitess can split it into:
+
+```text
+Shard 1A
+ ├── User 1-50M
+
+Shard 1B
+ ├── User 50M-100M
+```
+
+While the application is still running, Vitess:
+
+1. Creates new shards.
+2. Copies data in the background.
+3. Keeps old and new shards synchronized.
+4. Switches traffic to the new shards.
+5. Removes old shards.
+
+Users never notice the migration.
+
+Think of it as replacing a highway while cars are still driving on it.
+
+### 2. CockroachDB / Spanner Approach
+
+These databases don't expose shards to you.
+
+Instead, data is stored in small chunks called:
+
+```
+CockroachDB -> Ranges
+Spanner -> Splits
+
+Example:
+
+Range A
+Users 1-1M
+```
+
+As data grows:
+
+```text
+Range A
+Users 1-500k
+
+Range B
+Users 500k-1M
+```
+
+The database automatically splits the range.
+
+If traffic changes, it automatically moves ranges to different machines.
+
+You don't think about: `shard keys`, `shard counts`, `resharding scripts`.
+The database continuously balances everything.
+
+### 3. Stripe's Live Migration Approach
+
+Suppose you currently have: `Old Shard` and want to move to: `New Shard`.
+
+You can't simply flip a switch because mistakes happen.
+
+Instead, companies like Stripe use a cautious migration process.
+
+- **Double-write**: Write to both old and new shards simultaneously
+- **Backfill**: Copy historical data from old to new
+- **Verify**: Compare old and new to ensure completeness
+- **Shadow read**: Read from both and compare results
+- **Cutover**: Switch reads to new shards
+- **Cleanup**: Remove old shards
+
+## Composite Sharding
+
+Sometimes a single shard key isn't enough. Composite sharding combines multiple factors.
+
+### Discord's Approach
+
+Discord shards messages by (channel_id, bucket):
+
+- **channel_id**: All messages for one channel on the same shard (query locality)
+- **bucket**: Time-based bucket within the channel (prevents unbounded partition growth)
+
+This means "get messages in channel X from the last hour" hits one shard and one bucket — optimal for their primary access pattern.
+
+### Common Composite Patterns
+
+| Pattern         | Primary Key     | Secondary     | Use Case                           |
+| --------------- | --------------- | ------------- | ---------------------------------- |
+| user + time     | hash(user_id)   | time_bucket   | Per-user activity with time bounds |
+| tenant + entity | hash(tenant_id) | entity_id     | Multi-tenant SaaS                  |
+| region + user   | region          | hash(user_id) | Geo-distributed with data locality |
+
+> 💡 Interview Tip  
+> If an interviewer asks "how would you handle resharding?" — mention consistent hashing with virtual nodes for the theory, and Vitess or CockroachDB **for the practice**. Then say "Stripe uses a double-write → backfill → verify → cutover approach for zero-downtime migrations." That covers theory, tools, and real-world practice.
+
+---
+
+# Chapter 17 Cross-Shard Queries, Hot Spots, and When NOT to Shard
+
+## The Cost Nobody Mentions Upfront
+
+Sharding tutorials focus on the upside: horizontal scale, distributed writes, theoretically unlimited storage. But they rarely talk about what breaks:
+
+- Queries that used to be a single-table scan now fan out to every shard
+- That convenient JOIN between users and orders? Impossible if they're on different shards
+- One viral user's data melts a single shard while others sit idle
+- Every migration, backup, and monitoring task now happens N times
+  Sharding is a permanent architectural commitment with permanent
+
+trade-offs. Let's understand them so you can make informed decisions.
+
+## Cross-Shard Queries
+
+### The Problem
+
+With data sharded by `user_id`, the query "get all posts by user 42" is fast — it hits one shard. But "get the top 100 most-liked posts across all users" must:
+
+- Send the query to every shard
+- Wait for the slowest shard to respond (tail latency)
+- Merge and re-sort results from all shards
+
+This is called **scatter-gather**, and it gets worse with more shards. 10 shards = 10 parallel queries. 100 shards = 100 parallel queries. The P99 latency is bounded by the slowest shard.
+
+### Cross-Shard Joins
+
+Joins across shards are even harder. If `users` is sharded by `user_id` and `orders` is sharded by `order_id`, joining them requires fetching data from multiple shards on both tables, then joining in the application layer.
+
+Most sharded systems don't support cross-shard joins at all. You work around them.
+
+### Strategies to Avoid Cross-Shard Queries
+
+1. **Co-locate related data** : Shard `users` and `orders` by the same key (`user_id`). All of a user's orders live on the same shard as the user. Joins within a user's data stay on one shard.
+
+2. **Reference table replication** : Small, rarely-changing tables can be replicated to every shard. Joins against reference tables stay local.
+
+3. **Denormalization** : Instead of joining orders with products, store product_name and product_price directly on the order row. Eliminates the join entirely. Instagram stores author usernames on posts for this reason.
+
+4. **Application-level joins**: Fetch data from multiple shards, then join in application code.
+
+5. **Search index for global queries** : Sync data to Elasticsearch for queries that need to span all shards."Top 100 most-liked posts" becomes an Elasticsearch query, not a scatter-gather across shards.
+
+## Hot Spots
+
+## The Celebrity Problem
+
+Even with a perfect hash function and even distribution, some shards get disproportionate traffic.
+
+This isn't a distribution problem. The key itself is hot.
+
+## Time-Based Hot Spots
+
+If you shard by time range (messages from March on Shard 3, April on Shard 4), all new writes hit the current month's shard. The newest shard gets 100% of write traffic while historical shards get only reads.
+
+## Solutions
+
+**Salting the shard key**: Append a random suffix to hot keys. `user:12345` becomes `user:12345:0`, `user:12345:1`, ..., `user:12345:9`. Reads scatter across 10 shards and merge results. Writes distribute evenly.
+
+The trade-off: reads for that key are now 10x more expensive (scatter-gather). Only worth it for the hottest keys.
+
+**Request coalescing (Discord's approach)**: When 1,000 users request the same channel's messages simultaneously, the data services layer coalesces them into a single database read and fans the result out to all 1,000 requestors. The database sees 1 query instead of 1,000.
+
+This is an application-layer solution, not a database solution — and it was one of the most impactful changes in Discord's architecture.
+
+**Dedicated shards**: Move the hottest keys to their own dedicated shard with more resources. A directory-based sharding approach makes this possible — update the lookup table to route celebrity user IDs to beefier hardware.
+
+**Sharded counters**: Instead of one `like_count` field that every like contends for, split it into N counter shards. Each like increments a random shard. Total count = sum of all shards. Eliminates write contention.
+
+## The Alternatives Ladder
+
+Before sharding, exhaust every simpler option. Each step solves a class of problems with less complexity than sharding:
+
+```text
+Level 1: Indexing
+    └─ Query slow? Add the right index. Solves 80% of performance problems.
+
+Level 2: Read Replicas
+    └─ Read-heavy? Add replicas. Split reads to replicas, writes to primary.
+
+Level 3: Partitioning (single machine)
+    └─ Table too large? Use PostgreSQL PARTITION BY. Faster scans, easier maintenance.
+
+Level 4: Caching
+    └─ Hot data? Add Redis. Cache computed results, session data, rate limiting.
+
+Level 5: Connection Pooling
+    └─ Too many connections? Add PgBouncer. Multiplex client connections.
+
+Level 6: Sharding
+    └─ Exhausted everything above? Now consider sharding.
+
+Level 7: NewSQL
+    └─ Need sharding without the pain? Consider CockroachDB or Spanner.
+```
+
+## When NOT to Shard
+
+| Signal                                    | Why You Shouldn't Shard                            |
+| ----------------------------------------- | -------------------------------------------------- |
+| Data fits on one machine                  | Sharding adds complexity with zero benefit         |
+| Read replicas handle the load             | Reads are the bottleneck, not writes or storage    |
+| Caching solves the hot path               | Redis is simpler than resharding your database     |
+| You need complex cross-shard transactions | Distributed transactions across shards are painful |
+| Your team doesn't have the expertise      | Operational complexity of sharding is significant  |
+| A NewSQL database would work              | CockroachDB/Spanner auto-shard for you             |
+
+> 💡 Interview Tip  
+> The most impressive thing you can say in an interview about sharding is "I'd try these alternatives first." Walk through the ladder: "First I'd optimize indexes, add read replicas for read load, add caching for hot paths, and partition the largest tables. If we're still hitting limits — then I'd shard by user_id using hash-based sharding with consistent hashing." That shows you understand sharding is a last resort, not a first instinct.
+
+---
+
+# Chapter 18 Distributed Transactions — Sagas, Outbox, and 2PC
+
+## The Dinner Table Problem
+
+Two-Phase Commit is like getting everyone at a dinner table to agree on a restaurant before anyone moves. The coordinator asks each person: "Can you commit to Italian?" Everyone says yes. Then the coordinator says "Go." If even one person says no, nobody moves. It works -- but if the coordinator's phone dies mid-conversation, everyone is stuck standing in the hallway, unable to proceed.
+
+Sagas are like everyone ordering their own meal separately, with a refund policy. If the appetizer arrives but the kitchen runs out of your entree, you get a refund for the appetizer. Each step is independent, and each has a plan for undoing itself.
+
+## The Problem: One Operation, Many Databases
+
+In a monolith, a single database transaction can atomically update the orders table, the inventory table, and the payments table. One COMMIT, everything is consistent.
+
+In microservices, each service owns its own database:
+
+![Text32](/assets/32.png)
+
+There's no single transaction that spans all three databases. If the payment fails after inventory was already reserved, you need a way to undo the reservation. This is the distributed transaction problem.
+
+## Two-Phase Commit (2PC)
+
+The oldest solution. A coordinator manages the transaction across all participants.
+
+**Phase 1: Prepare** :
+The coordinator asks each participant: "Can you commit this?" Each participant acquires locks, validates the operation, and responds YES or NO.
+
+**Phase 2: Commit (or Abort)** :If all participants said YES, the coordinator sends COMMIT. If any said NO, the coordinator sends ABORT and everyone rolls back.
+
+![Text33](/assets/33.png)
+
+### Why 2PC Is Problematic
+
+## Problems with 2-Phase Commit (2PC)
+
+| Problem                 | Explanation                                                                                                                                   |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Blocking                | If the coordinator crashes after PREPARE but before COMMIT, all participants hold locks indefinitely, waiting for a decision that never comes |
+| Latency                 | Two network round-trips minimum. Cross-region, this adds 100–400ms                                                                            |
+| Tight coupling          | All participants must implement the 2PC protocol. Adding a new service means integrating it into the coordination layer                       |
+| Single point of failure | The coordinator is a bottleneck. If it dies, the entire transaction is in limbo                                                               |
+
+2PC is still used within a single database (that's how PostgreSQL handles multi-table transactions internally). But across services over a network, it's generally avoided.
+
+![Txet34](/assets/34.png)
+
+## The Saga Pattern
+
+A Saga breaks a distributed operation into a sequence of local transactions. Each local transaction updates one service's database and triggers the next step. If any step fails, previously completed steps are undone by compensating transactions.
+
+### E-Commerce Order Example
+
+```text
+Happy path:
+  1. Order Service    → Create order (status: PENDING)
+  2. Inventory Service → Reserve items
+  3. Payment Service   → Charge credit card
+  4. Order Service    → Update order (status: CONFIRMED)
+  5. Shipping Service  → Schedule shipment
+
+Failure path (payment fails at step 3):
+  3. Payment Service   → Charge fails
+  2. Inventory Service → COMPENSATE: Release reservation
+  1. Order Service    → COMPENSATE: Cancel order (status: CANCELLED)
+```
+
+Each step is a local ACID transaction within a single service. The Saga coordinates the sequence. The key insight: instead of one big atomic operation, you get a series of small atomic operations with explicit undo logic.
+
+#### Choreography vs Orchestration
+
+There are two ways to coordinate a Saga:
+
+**Choreography**: Each service publishes events, and other services react. No central coordinator.
+
+![Text35](/assets/35.png)
+
+- **Pros**: Simple for small flows. No single point of failure. Services are loosely coupled.
+
+- **Cons**: Hard to track the overall flow. Debugging is painful -- you're chasing events across 5 services. Adding a step means modifying multiple services.
+
+**Orchestration**: A central Saga orchestrator directs each step explicitly.
+![Text36](/assets/36.png)
+
+- **Pros**: Easy to understand the flow. Easy to add or reorder steps. Centralized error handling and retry logic.
+
+- **Cons**: The orchestrator is a single point of failure (mitigated by making it stateful and persistent). Can become a bottleneck.
+
+In practice, most teams at scale use orchestration. Netflix built Conductor, Uber built Cadence (now Temporal) -- both are Saga orchestration frameworks.
+
+## The Dual-Write Problem
+
+It occurs when a service needs to update two different systems as part of a single business operation, but there is no way to make those updates happen atomically. A common example is an Order Service that, after creating an order, must both save the order in its database and publish an OrderCreated event to Kafka so that other services, such as Inventory or Shipping, can react. Since the database and Kafka are separate systems, a single ACID transaction cannot cover both operations.
+
+## The Outbox Pattern
+
+The Outbox pattern solves dual-writes by using the database itself as the message queue.
+
+Instead of writing the order to the database and immediately publishing an event to Kafka, the application writes the order and an event record into a special **outbox table** in one atomic transaction.
+
+For example, when a customer places an order, the Order Service inserts a row into the orders table and also inserts an `OrderCreated` event into the `outbox` table. Because both inserts happen within the same database transaction, they either both succeed or both fail. If the transaction commits, the order exists and the event is safely stored. If the transaction rolls back, neither the order nor the event exists. This eliminates the possibility of having an order without an event or an event without an order.
+
+After the transaction commits, a separate component called the **outbox relay** is responsible for publishing events from the outbox table to Kafka. The relay reads unprocessed rows, publishes the events, and then marks them as processed . If Kafka is temporarily unavailable or the relay crashes, nothing is lost because the event remains stored in the database. The relay can simply retry later. This gives the system reliable event delivery without requiring a distributed transaction between the database and Kafka.
+
+There are two common ways to implement the outbox relay. The simpler approach is **polling** . where a background job periodically queries the outbox table for new events. This is easy to implement but introduces some delay because events are only published during the next polling cycle, and it creates additional database load. The more scalable approach is **Change Data Capture (CDC)**.
+
+> 💡 Interview Tip  
+> If asked "How would you handle a transaction that spans multiple microservices?", don't jump straight to 2PC. Explain that 2PC is blocking and fragile across services, then propose the Saga pattern. Mention choreography vs orchestration, lean toward orchestration for complex flows, and bring up the outbox pattern for reliable event publishing. If you mention Temporal or a similar framework, you'll signal that you know how production systems actually solve this.
+
+## Idempotency Keys — Making Retries Safe
+
+Distributed transactions often require retries — networks fail, services timeout, messages get duplicated. But retrying a payment charge without protection might charge the customer twice.
+
+Idempotency keys solve this. The client generates a unique key for each operation and includes it with every request and retry.
+
+---
+
+# Chapter 19 CQRS, Event Sourcing, and Materialized Views
+
+## The Problem: Reads and Writes Want Different Things
+
+Imagine a banking application. For **writes**, you need strict ACID transactions — "transfer $100 from account A to account B" must be atomic, consistent, and isolated. A normalized schema with proper constraints is essential.
+
+For **reads**, the same bank needs dashboards showing "total transactions this month," "average balance by region," "suspicious activity patterns." These queries need denormalized data with pre-computed aggregates — the opposite of what writes want.
+
+Trying to serve both through the same data model is like using the same vehicle for Formula 1 racing and cross-country hauling. You end up with a compromised design that's mediocre at both.
+
+## From Denormalization to CQRS — A Spectrum
+
+If you've read the Schema Design chapter, you already know the basics of this pattern. we denormalized a `like_count` onto the posts table to avoid a COUNT(\*) join on every read. That was a simple, manual optimization: one denormalized field, updated atomically on writes.
+
+CQRS is the same idea taken to its logical conclusion. Instead of sprinkling denormalized fields across your existing tables, you build an entirely separate read model — purpose-built for your query patterns — alongside the write model. Think of it as a progression:
+
+```text
+Level 1: Denormalized column (like_count on posts)        ← Chapter 4
+Level 2: Materialized view (pre-computed query result)     ← This lesson
+Level 3: Separate read database (Elasticsearch, Redis)     ← Full CQRS
+Level 4: Event-sourced writes + derived read models        ← CQRS + Event Sourcing
+```
+
+Each level adds complexity but solves a wider gap between read and write requirements.
+
+![Text37](/assets/37.png)
+
+## CQRS — Command Query Responsibility Segregation
+
+CQRS splits your system into two sides:
+
+**Command side (writes)**: Handles mutations. Normalized, optimized for consistency. Uses ACID transactions.
+
+**Query side (reads)**: Handles reads. Denormalized, optimized for specific query patterns. Can use different storage entirely.
+
+![text38](/assets/38.png)
+
+The write model publishes events when data changes. The read model consumes those events and updates its denormalized views. The two models are eventually consistent — there's a small delay between a write and its appearance in the read model.
+
+### When CQRS Is Worth It
+
+| Signal                                               | Why CQRS Helps                               |
+| ---------------------------------------------------- | -------------------------------------------- |
+| Read/write ratio is wildly skewed (1000:1)           | Scale reads independently of writes          |
+| Read and write schemas are very different            | Each model is optimized for its purpose      |
+| Need to serve different read patterns from same data | Multiple read models for different consumers |
+| Need an audit trail                                  | Events provide a natural changelog           |
+
+### When CQRS Is Overkill
+
+For a simple CRUD application where reads and writes use the same schema, CQRS adds complexity with no benefit. A single PostgreSQL database with read replicas serves most applications perfectly.
+
+## Event Sourcing — Store Every Change
+
+### Current State vs Event History
+
+**Traditional approach**: Store current state. When a user updates their name from "Alice" to "Alicia," you overwrite the row. The old value is gone.
+
+**Event sourcing**: Store every change as an immutable event. Never overwrite.
+
+```text
+Event Store:
+┌─────┬────────────────┬──────────────────────┬────────────┐
+│ seq │ event_type     │ payload              │ timestamp  │
+├─────┼────────────────┼──────────────────────┼────────────┤
+│  1  │ AccountCreated │ {id: 1, name: Alice} │ 2024-01-15 │
+│  2  │ NameChanged    │ {id: 1, name: Alicia}│ 2024-03-20 │
+│  3  │ EmailChanged   │ {id: 1, email: new}  │ 2024-03-22 │
+│  4  │ AccountDeleted │ {id: 1}              │ 2024-06-01 │
+└─────┴────────────────┴──────────────────────┴────────────┘
+
+Current state of account 1 = replay events 1→2→3→4 = deleted
+```
+
+### Why This Matters
+
+- **Complete audit trail**: Every change is recorded. Perfect for financial systems, compliance, and debugging ("what happened to this user's account between March 15 and March 20?").
+
+- **Time travel**: Rebuild the state of any entity at any point in time by replaying events up to that timestamp.
+
+- **Rebuild read models**: If you realize your read model needs a different structure, replay all events to build a new one from scratch. No data migration needed.
+
+- **Decoupled systems**: Multiple downstream services can consume the same event stream and build their own views of the data.
+
+### The Costs
+
+- **Complexity**: Simple CRUD becomes event design.
+
+- **Storage**: Events accumulate forever. Snapshotting (periodically saving current state) helps — replay from the latest snapshot, not from the beginning of time.
+
+- **Eventual consistency**: Read models lag behind the event stream. A user changes their name and might see the old name for a second.
+
+- **Event versioning**: When the schema of an event changes, old events in the store still have the old format. You need upcasting or versioned event handlers.
+
+## Materialized Views — Pre-Computed Query Results
+
+A **materialized view** is a query result stored as a table. Instead of computing the result on every read, you compute it once and serve the pre-built result.
+
+### PostgreSQL Materialized Views
+
+```sql
+-- Create a materialized view of daily order totals
+CREATE MATERIALIZED VIEW daily_order_totals AS
+SELECT
+    DATE(created_at) AS order_date,
+    COUNT(*) AS total_orders,
+    SUM(amount) AS total_revenue
+FROM orders
+GROUP BY DATE(created_at);
+
+-- Refresh when data changes (or on a schedule)
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_order_totals;
+```
+
+The view is a real table on disk. Queries against it are fast — no aggregation at query time.
+
+**CONCURRENTLY** refreshes the view without locking reads. Readers see the old data until the refresh completes, then atomically see the new data.
+
+### Star Schema and Snowflake Schema
+
+For analytics workloads, materialized views connect to a broader pattern: dimensional modeling.
+
+Star Schema: A central fact table (measurements like order amounts, click counts) surrounded by dimension tables (descriptive data like products, dates, customers). Dimensions are denormalized.
+
+```text
+         [dim_product]
+              |
+[dim_date]──[fact_orders]──[dim_customer]
+              |
+         [dim_store]
+```
+
+**Snowflake Schema**: Like star, but dimensions are further normalized into sub-tables (product → category → department). Less redundancy, more joins.
+
+**OLTP vs OLAP**: Your main application database (OLTP) is optimized for transactions. Analytics databases (OLAP) are optimized for aggregation queries. Star schema lives in the OLAP world — data warehouses like BigQuery, Redshift, Snowflake.
+
+| Aspect     | OLTP                   | OLAP                          |
+| ---------- | ---------------------- | ----------------------------- |
+| Purpose    | Transactions           | Analytics                     |
+| Operations | INSERT, UPDATE, DELETE | SELECT + aggregation          |
+| Schema     | Normalized (3NF)       | Denormalized (Star/Snowflake) |
+| Example    | PostgreSQL, MySQL      | BigQuery, Redshift            |
+
+## Putting It All Together
+
+CQRS, event sourcing, and materialized views are often combined:
+
+![Text39](/assets/39.png)
+
+Events are the glue: the write model emits events, and multiple read models consume them to build different views of the same data. Each consumer is independent and can use the storage technology that best fits its query pattern.
+
+---
+
+# Chapter 20 Schema Evolution and Zero-Downtime Migrations
+## The Kitchen Renovation Analogy
+Your application is serving live traffic. You need to change the schema without breaking anything. Every change must be backward-compatible with the currently running application code.
+
+## The Expand-Contract Pattern
+This is the fundamental pattern for zero-downtime schema changes. Three phases:
+
+### Phase 1: Expand
+Add new structures alongside old ones. Don't remove or rename anything.
+
+```sql
+-- Want to rename "name" to "display_name"?
+-- Step 1: Add the new column (expand)
+ALTER TABLE users ADD COLUMN display_name VARCHAR(100);
+```
+The old `name` column still exists. The old application code still works.
+
+### Phase 2: Migrate
+Update application code to write to both columns. Backfill historical data.
+
+```sql
+-- Backfill existing data
+UPDATE users SET display_name = name WHERE display_name IS NULL;
+```
+
+### Phase 3: Contract
+Once all code reads from the new column and all data is migrated, remove the old column.
+
+```sql
+-- Step 3: Drop the old column (contract)
+ALTER TABLE users DROP COLUMN name;
+```
+This final step only happens after the new application code is deployed everywhere and verified.
+
+## Safe vs Dangerous Operations
+### Safe — Do These Without Worry
+| Operation | Why It's Safe |
+|-----------|---------------|
+| Add a new table | No existing code references it |
+| Add a nullable column | Existing rows get `NULL`, old code ignores it |
+| Add an index `CONCURRENTLY` | PostgreSQL builds the index without locking the table |
+| Add a new view | No impact on existing tables |
+| Increase column size | `VARCHAR(50)` → `VARCHAR(100)` is backward-compatible |
+### Dangerous — Handle With Care
+| Operation | Risk | Safe Approach |
+|-----------|------|---------------|
+| Rename a column | All queries referencing old name break instantly | Expand-contract: add new column, copy data, update code, then drop old column |
+| Add NOT NULL constraint | Old code inserting without the column fails | Add column as nullable first, backfill data, then add the constraint |
+| Change column type | Existing data might not convert cleanly | Add a new column with the new type, migrate data, then switch code over |
+| Drop a column | Any code still referencing it crashes | Verify zero references in code and queries before dropping |
+| Rename a table | Same as renaming a column, but with broader impact | Create a new table, double-write, migrate traffic/data, then drop the old table |
+
+## A Real Walkthrough: Adding a Required Column
+Your users table needs a `timezone` column, and it should be NOT NULL with a default.
+
+**Wrong way (causes downtime):**
+```sql
+-- This locks the table for the entire rewrite in older PostgreSQL versions
+ALTER TABLE users ADD COLUMN timezone VARCHAR(50) NOT NULL DEFAULT 'UTC';
+```
+
+**Safe way (expand-contract):**
+```sql
+-- Step 1: Add nullable column (instant, no lock)
+ALTER TABLE users ADD COLUMN timezone VARCHAR(50);
+
+-- Step 2: Backfill in batches (not all at once!)
+UPDATE users SET timezone = 'UTC' WHERE timezone IS NULL AND id BETWEEN 1 AND 100000;
+UPDATE users SET timezone = 'UTC' WHERE timezone IS NULL AND id BETWEEN 100001 AND 200000;
+-- ... continue in batches to avoid locking the table
+
+-- Step 3: Update app code to always write timezone
+
+-- Step 4: Add NOT NULL constraint after all rows have values
+ALTER TABLE users ALTER COLUMN timezone SET NOT NULL;
+ALTER TABLE users ALTER COLUMN timezone SET DEFAULT 'UTC';
+```
+Batching the backfill prevents long-running transactions that lock the table and block writes.
+
+
+## Migration Tools
+| Tool | Database | Approach |
+|------|----------|----------|
+| Flyway | Any (SQL-based) | Versioned SQL migration files. Developer-friendly. |
+| Liquibase | Any (XML/YAML/SQL) | Enterprise-focused. Supports rollbacks. |
+| gh-ost | MySQL | GitHub's online schema migration tool. Copies table, applies changes, and swaps atomically with zero locks. |
+| pgroll | PostgreSQL | Schema migrations with automatic expand-contract support. |
+| Alembic | PostgreSQL (Python) | SQLAlchemy's migration tool. Auto-generates schema diffs. |
+
+**gh-ost** deserves special mention: it creates a shadow copy of the table, applies the schema change to the copy, replays any writes that happened during the copy via binlog, then atomically renames the tables. The original table is never locked.
+
+
+## Soft Deletes vs Hard Deletes
+### Soft Deletes
+Instead of `DELETE FROM users WHERE id = 42`, set a flag:
+
+```sql
+UPDATE users SET is_deleted = true, deleted_at = NOW() WHERE id = 42;
+```
+**Pros:**
+
+- Undo capability ("oops, restore that user")
+- Audit trail (who was deleted and when)
+- Referential integrity preserved (no cascading deletes)
+
+**Cons:**
+
+- Every query needs WHERE is_deleted = false — forget it once and you leak deleted data
+- Indexes include deleted rows (bloat)
+- Storage grows indefinitely
+- Privacy concerns (GDPR "right to be forgotten" may require actual deletion)
+
+
+### A Better Alternative: Audit Log Table
+Instead of soft deletes on every table, maintain a separate audit log:
+
+```sql
+CREATE TABLE audit_log (
+    id BIGINT PRIMARY KEY,
+    table_name VARCHAR(50),
+    record_id BIGINT,
+    action VARCHAR(10),  -- INSERT, UPDATE, DELETE
+    old_data JSONB,
+    new_data JSONB,
+    changed_by BIGINT,
+    changed_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+Hard delete the original row (clean data, no `WHERE is_deleted` everywhere), but capture the full state in the audit log. Best of both worlds: clean operational data + complete history.
+
+## Temporal Data — SCD Type 2
+Slowly Changing Dimensions (SCD Type 2) tracks history with `valid_from` and `valid_to` timestamps:
+```sql
+CREATE TABLE product_prices (
+    product_id BIGINT,
+    price DECIMAL(10,2),
+    valid_from TIMESTAMP NOT NULL,
+    valid_to TIMESTAMP DEFAULT '9999-12-31',
+    PRIMARY KEY (product_id, valid_from)
+);
+```
+
+```text
+product_prices
+┌────────────┬────────┬────────────┬────────────┐
+│ product_id │ price  │ valid_from │ valid_to   │
+├────────────┼────────┼────────────┼────────────┤
+│     1      │  9.99  │ 2024-01-01 │ 2024-06-30 │
+│     1      │ 12.99  │ 2024-07-01 │ 9999-12-31 │  ← current
+└────────────┴────────┴────────────┴────────────┘
+```
+
+Current price: `WHERE product_id = 1 AND valid_to = '9999-12-31'` Price on March 15: `WHERE product_id = 1 AND valid_from <= '2024-03-15' AND valid_to >= '2024-03-15'`
+
+This pattern is critical for financial reporting, compliance, and any system where you need to answer "what was the value at time X?"
+
+> 💡 Interview Tip  
+> If you need to add a column or change a schema in a system design discussion, say "I'd use the expand-contract pattern — add the new column alongside the old one, backfill data, update the application code, then drop the old column. This avoids downtime." That's a senior-level answer.
+
+
+---
